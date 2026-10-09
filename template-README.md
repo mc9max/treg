@@ -1,6 +1,6 @@
 # Deploy and Host treg on Railway
 
-[![Deploy to Railway](https://railway.app/button.svg)](https://railway.com/deploy/heb2iW)
+[![Deploy to Railway](https://railway.app/button.svg)](https://railway.com/deploy/treg)
 
 OpenRouter for agent tools — one base URL and one token to reach a catalog
 of thousands of priced API endpoints (SEO, social, enrichment, ads, scraping,
@@ -62,11 +62,12 @@ by the deploy form — **no sidecar service is required**:
 - **Postgres** (optional, recommended for production) — `TREG_DATABASE_URL`
   defaults to the bundled SQLite on the persistent volume. Point this at a
   Postgres service when you want multi-replica durability.
-- **A public domain** — `TREG_PUBLIC_URL` is pre-filled from `system.domain`
-  (railway.com's `*.up.railway.app` by default); override it if you front
-  treg with a custom domain. This value anchors the OAuth callback
-  (`<TREG_PUBLIC_URL>/auth/github/callback`) and is what a fresh installer
-  hits from their agent.
+- **A public domain** — `TREG_PUBLIC_URL` is pre-filled from the deployment's
+  domain via the `RAILWAY_PUBLIC_DOMAIN` system reference (the
+  `*.up.railway.app` URL by default); override it if you front treg with a
+  custom domain. This value anchors the OAuth callback
+  (`https://YOUR-DEPLOYMENT-DOMAIN/auth/github/callback`) and is what a fresh
+  installer hits from their agent.
 
 No other required services. The optional integrations (each a variable on
 the deploy form; leaving them blank just disables that door — the deploy
