@@ -1,0 +1,43 @@
+[
+  {
+    "account_id": "tiktok",
+    "nickname": "TikTok",
+    "biography": "One TikTok can make a big impact",
+    "awg_engagement_rate": 0.00015562697368421053,
+    "comment_engagement_rate": 1.0302631578947368e-05,
+    "like_engagement_rate": 0.00014532434210526315,
+    "bio_link": "https://linktr.ee/tiktok",
+    "predicted_lang": "en",
+    "is_verified": true,
+    "followers": 95000000,
+    "following": 0,
+    "likes": 462200000,
+    "videos_count": 1485,
+    "create_time": "2015-02-28T17:22:29.000Z",
+    "id": "107955",
+    "url": "https://www.tiktok.com/@tiktok",
+    "profile_pic_url": "https://p19-common-sign.tiktokcdn-us.com/tos-useast5-avt-0068-tx/ba67b11de451691939223e9d978e613a~tplv-tiktokx-cropcenter:720:720.jpeg?dr=9640&refresh_token=59a17944&x-expires=1785585600&x-signature=H… [293 chars]",
+    "like_count": 462200000,
+    "digg_count": 0,
+    "is_private": false,
+    "profile_pic_url_hd": "https://p16-common-sign.tiktokcdn-us.com/tos-useast5-avt-0068-tx/ba67b11de451691939223e9d978e613a~tplv-tiktokx-cropcenter:1080:1080.jpeg?dr=9640&refresh_token=2743c5cc&x-expires=1785585600&x-signature… [297 chars]",
+    "secu_id": "MS4wLjABAAAAv7iSuuXDJGDvJkmH_vz1qkDZYo1apxgzaxdBSeIuPiM",
+    "open_favorite": false,
+    "is_ad_virtual": false,
+    "top_videos": [
+      {
+        "video_id": "7667962394538183967",
+        "share_count": 172,
+        "playcount": 110200,
+        "diggcount": 2848,
+        "commentcount": 627,
+        "create_date": "2026-07-29T14:50:52.000Z",
+        "video_url": "https://www.tiktok.com/@tiktok/video/7667962394538183967",
+        "cover_image": "https://p19-common-sign.tiktokcdn-us.com/tos-useast8-p-0068-tx2/ooEABIAxEXBToMTVJDA7BIazELqa0RDi0himv~tplv-tiktokx-origin.image?dr=9636&x-expires=1785585600&x-signature=AULn938GKW%2FkqTdcqyu8OIC53ZA%3… [263 chars]",
+        "favorites_count": 186
+      },
+      "… 15 more item(s) truncated"
+    ],
+    "…": "6 more field(s) truncated"
+  }
+]

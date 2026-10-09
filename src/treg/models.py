@@ -1,0 +1,2053 @@
+"""The registry data model — minimal on purpose (charter: don't invent extra nouns).
+
+Multi-tenancy (orgs) shape: an **Org** is the tenant that owns resources; a **User** is a
+global identity; a **Membership** links a user to an org with a role and IS where the caller's
+token lives (a token = a (user, org) pair). Secrets/tools/bundles/call records carry `org_id`,
+so every list/call/mutation is scoped to the caller's org. See docs/MULTI-TENANCY-PLAN.md.
+"""
+
+from __future__ import annotations
+
+from datetime import date, datetime, timezone
+from typing import Annotated
+
+from pydantic import NaiveDatetime
+from sqlalchemy import BigInteger, Boolean, JSON, CheckConstraint, Column, Index, Integer, UniqueConstraint, text
+from sqlmodel import Field, SQLModel
+
+# SQLModel 0.0.45+ rejects naive datetime binds unless fields are annotated with NaiveDatetime.
+# Our schema is intentionally TIMESTAMP WITHOUT TIME ZONE (migration 0017), and `_now()` returns
+# naive UTC. This alias makes every datetime field and query bind work under the new validation.
+NaiveUTC = Annotated[datetime, NaiveDatetime]
+
+# Role ordering for gates (owner > admin > member > viewer).
+# viewer = read + call only (cannot register/manage); member+ can register tools/secrets/skills.
+ROLE_RANK = {"viewer": 0, "member": 1, "admin": 2, "owner": 3}
+
+
+def _now() -> datetime:
+    # Naive UTC (drop tzinfo): our datetime columns are TIMESTAMP WITHOUT TIME ZONE, and Postgres
+    # (asyncpg) rejects a tz-aware value into a naive column. The rest of the app already stores +
+    # compares naive UTC (api._utcnow_naive / _as_naive); keep models consistent. SQLite is lax, so
+    # this only bites on Postgres — the deploy target.
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
+class Org(SQLModel, table=True):
+    """A tenant (team). Owns secrets/tools/bundles; resources are scoped by `org_id`.
+    Verified sign-in creates only a user; the user explicitly creates or joins a team.
+    """
+
+    id: int | None = Field(default=None, primary_key=True)
+    name: str
+    slug: str = Field(index=True, unique=True)
+    # The slug before the last rename. Signed team keys, `~/.treg` and MCP pins carry the slug, so
+    # the old one keeps resolving (see access._resolve_org) instead of revoking every copied key.
+    # ponytail: one alias only; a second rename overwrites it. An alias table if that ever bites.
+    previous_slug: str | None = Field(default=None, index=True)
+    suspended: bool = Field(default=False)  # a suspended org's members are locked out (403)
+    demo: bool = Field(default=False)  # a sandbox team seeded by onboarding — labeled + one-click removable
+    # A team whose token is published (e.g. on the landing page): non-admin members are locked to
+    # /call + reads, and may never act as a user (see api.require_member / require_identity).
+    public_demo: bool = Field(default=False)
+    # Prepaid balance in micro-USD (1e-6 USD), MATERIALIZED as sum(CreditBlock.remaining) minus the
+    # open Holds. It exists as a column, not a query, because it is the hot-path spend gate: one
+    # conditional UPDATE against this integer is what stops concurrent agent calls racing past zero
+    # (see ledger.reserve). Only `domain/money` may write it.
+    balance_micro: int = Field(default=0)
+    # "Committed since midnight UTC": everything settled today plus everything still held from
+    # today - the number the fail-closed daily cap is checked against on EVERY metered call. Kept
+    # here, in the same UPDATE that moves the balance, because the equivalent aggregate over
+    # `ledgerentry` cost a scan of the platform's whole day per call and emptied the API pool
+    # (revision 0022). Written ONLY by domain/money; `spent_today_day` says which UTC day the
+    # counter belongs to, and a movement on a later day resets it.
+    spent_today_micro: int = Field(default=0, sa_column=Column("spent_today_micro", BigInteger, nullable=False, server_default="0"))
+    spent_today_day: date | None = Field(default=None)
+
+    # ---- Stripe billing (see billing.py; NO card data ever lands here) ----------------------------
+    # The org's Stripe Customer. Created lazily on the first top-up and reused forever after, because
+    # it is what carries the saved payment method — a second customer would silently orphan the card.
+    stripe_customer_id: str | None = Field(default=None, index=True)
+    # The saved card to charge off-session, as a Stripe PaymentMethod id (`pm_…`). An OPAQUE REFERENCE,
+    # not card data: treg never sees a PAN, so there is nothing here to leak beyond a token that only
+    # works with our own secret key. Null = no card on file → auto-top-up cannot be armed.
+    stripe_default_pm: str | None = Field(default=None)
+    # Auto-top-up: refill the balance without a human when it dips below the threshold. Off unless the
+    # org explicitly turned it on AND recorded consent — an off-session charge with no mandate is an
+    # unauthorized charge under PSD2/SCA, so `autotopup_consented_at` gates the charge, not the UI.
+    autotopup_enabled: bool = Field(default=False)
+    autotopup_threshold_micro: int = Field(default=0)   # 0 = "use the configured default"
+    autotopup_amount_micro: int = Field(default=0)      # 0 = "use the configured default"
+    autotopup_monthly_cap_micro: int = Field(default=0)  # 0 = "use the configured default"
+    # How many automatic charges may run in one hour after a SUCCESSFUL one (0 = the configured
+    # default). Part of the mandate the team agreed to, so it is stored next to the amounts.
+    autotopup_max_per_hour: int = Field(default=0)
+    # WHEN the org agreed to the threshold/amount it is being charged on. The MIT mandate: a compliance
+    # record, which is why it is a timestamp and not a boolean — "they ticked a box at some point" is
+    # not defensible in a dispute, "they agreed on 2026-07-30T11:02Z" is.
+    autotopup_consented_at: NaiveUTC | None = Field(default=None)
+    # Why auto-top-up turned itself OFF (e.g. "authentication_required", "max_attempts"). Non-null is
+    # the banner the dashboard shows: a silent disable is how an org discovers its agents are broken.
+    autotopup_disabled_reason: str | None = Field(default=None)
+    # Cross-instance cooldown: the DB, not a process-local lock, is what stops two web workers (or a
+    # burst of concurrent calls) from firing two charges as the balance crosses the threshold.
+    autotopup_last_attempt_at: NaiveUTC | None = Field(default=None)
+    autotopup_failures: int = Field(default=0)  # CONSECUTIVE failures; a success resets it to 0
+    # A PaymentIntent that needs the cardholder present (3DS). Kept so the dashboard can offer an
+    # on-session "finish this payment" link instead of starting a fresh charge the bank will re-decline.
+    autotopup_recovery_pi: str | None = Field(default=None)
+
+    # ---- caller tags & spend ceiling (see api._parse_call_meta, api._enforce_tag_budgets) --------
+    # Which keys of the X-Treg-Meta bag this team may set budgets on. DECLARED rather than arbitrary
+    # because each one is an indexed lookup on every proxied call and a row per value per call —
+    # a team budgeting on `session` would write an aggregate row per conversation. Bounded at 3.
+    budget_dims: list | None = Field(default=None, sa_column=Column("budget_dims", JSON, nullable=True))
+    # The ONE dimension that scopes idempotency. Retry partitioning cannot generalize: a call tagged
+    # `customer=a, workspace=b` has no principled answer for which of them partitions its keys.
+    primary_dim: str = Field(default="customer")
+    # This team's own ceiling on daily spend from treg's keys, in micro-USD. 0 = use the deployment
+    # default. The EFFECTIVE cap is min(this, the platform ceiling): a team may lower it freely, and
+    # raising it past the ceiling is refused — which makes that a conversation with us rather than an
+    # env-var edit that lifts the blast-radius rail for every team at once.
+    daily_cap_micro: int = Field(default=0)
+
+    # ---- Google Ads attribution (see adsconv.py) --------------------------------------------------
+    # The click that produced this team, captured as a first-party cookie on landing and persisted
+    # here at signup. Kept for the life of the team: a top-up weeks later still attributes to it.
+    ad_gclid: str | None = Field(default=None)
+    # Which mutually-exclusive Google click-id field ad_gclid contains. NULL means a legacy GCLID.
+    ad_click_id_type: str | None = Field(default=None)  # gclid | gbraid | wbraid
+    ad_click_at: NaiveUTC | None = Field(default=None)
+    ad_landing: str | None = Field(default=None)  # utm_content — the landing page id (p1…p5)
+    # ---- traffic-source attribution (see web/sitetrack.js) --------------------------------------
+    # First-touch `utm_*` + referring host, captured as the first-party `treg_utm` cookie on the
+    # visitor's FIRST page and persisted here at signup, in both signup doors. Answers "how many
+    # teams did campaign X bring, and did they call anything" — a question the Google-only
+    # `ad_*` columns above cannot. Set once, never overwritten; NULL = organic/unknown.
+    utm_source: str | None = Field(default=None)
+    utm_medium: str | None = Field(default=None)
+    utm_campaign: str | None = Field(default=None)
+    utm_term: str | None = Field(default=None)
+    utm_content: str | None = Field(default=None)
+    utm_referrer: str | None = Field(default=None)  # referring hostname, e.g. botdirectory.ai
+    # Set ONCE, by a guarded UPDATE in the /call/ handler. Deliberately not derived from CallRecord:
+    # audit.py sheds rows past its queue bound, so a derived value undercounts exactly under load.
+    first_call_at: NaiveUTC | None = Field(default=None)
+
+    created_at: NaiveUTC = Field(default_factory=_now)
+    # Opt-OUT of overflow (docs/context/ops/capacity.md): when treg's own account for a provider is
+    # out, a metered call may be served through a treg-owned aggregator account on the same endpoint.
+    # Default allowed (disclosed via X-Treg-Served-Via); a team that must not have its requests
+    # relayed through a third party sets this (`treg org overflow off`). Stored as the opt-out so the
+    # column default is the plain `false` in Python — and LAST in the class, because alembic's
+    # add_column appends, keeping create_all test schemas aligned with the migrated shape.
+    platform_overflow_disabled: bool = Field(default=False)
+
+
+class User(SQLModel, table=True):
+    """A global identity (one email/login). Identity ONLY — the token and role live on
+    Membership, so one person in two orgs has two memberships (two tokens), one User.
+    """
+
+    id: int | None = Field(default=None, primary_key=True)
+    email: str = Field(index=True, unique=True)
+    # Only an inbox proof or a provider-verified email can set this. Legacy /users and
+    # admin-visible invitation codes are not email proofs.
+    email_verified_at: NaiveUTC | None = Field(default=None)
+    # Consumed atomically with the signup grant; survives leaving/deleting every team.
+    # The DB default is false so pre-upgrade users and old writers never gain a fresh claim.
+    signup_promo_available: bool = Field(
+        default=True, sa_column=Column(Boolean, nullable=False, server_default=text("false")),
+    )
+    is_superadmin: bool = Field(default=False)  # cross-tenant platform admin (see /admin/*)
+    suspended: bool = Field(default=False)  # suspended users cannot authenticate
+    # Bumped to revoke every token this user holds at once (session cookie + CLI tokens). A signed
+    # Signed credentials carry the token_version they were minted at; a mismatch = revoked.
+    token_version: int = Field(default=0)
+    onboarded: bool = Field(default=False)  # has completed OR skipped first-run onboarding (don't re-offer)
+    demo: bool = Field(default=False)  # a fake teammate seeded into a demo team (can't log in; excluded from stats)
+    # This person's referral code (`treg.to/?ref=<code>`). On the USER, not the Org, because a person
+    # refers a friend — and because anyone may create unlimited orgs, so a per-org code would hand the
+    # same human unlimited codes to farm with. NULL until they open the Referrals page; minted lazily
+    # so we never generate codes for the majority who never look. See referrals.py.
+    referral_code: str | None = Field(default=None, index=True, unique=True)
+    created_at: NaiveUTC = Field(default_factory=_now)
+
+
+class Membership(SQLModel, table=True):
+    """Links a User to an Org with a role, and carries that pairing's token.
+    The caller presents a token; we store only its SHA-256 hash. Access = "are you a member
+    of the org that owns this?" (+ role for destructive actions).
+    """
+
+    __table_args__ = (UniqueConstraint("user_id", "org_id", name="uq_membership_user_org"),)
+
+    id: int | None = Field(default=None, primary_key=True)
+    user_id: int = Field(foreign_key="user.id", index=True)
+    org_id: int = Field(foreign_key="org.id", index=True)
+    role: str = Field(default="member")  # owner | admin | member
+    token_hash: str = Field(index=True)
+    # Who minted this membership (agents name their creating admin; "" for people who came through
+    # a login door or invite — the invite itself records invited_by).
+    created_by: str = Field(default="")
+    # For an agent promoted from the observed roster: "member-email|runtime" (e.g.
+    # "sam@x.dev|claude-code"). The observed-agents view excludes this pair while the agent lives —
+    # the detected row "became" this agent — and revoking the agent naturally resurfaces it.
+    promoted_from: str = Field(default="")
+    webhook_url: str | None = Field(default=None)  # health alerts for this member's org POST here
+    # Per-user, per-day usage cap for this org (counts proxy calls + local + server runs). -1 = unlimited
+    # (the default — nobody is capped until an admin sets a limit). See governance/usage.enforce_daily_cap.
+    daily_call_cap: int = Field(default=-1)
+    # The number that cap is checked against: usage events the gate has admitted since midnight
+    # UTC, and which UTC day it belongs to. Taken with ONE conditional UPDATE per capped call, so
+    # the check costs no count over `callrecord` (which had read a member's whole history per
+    # call - revision 0024) and the cap is exact rather than "a few extra slip through". Only
+    # capped members are counted; the roster's `used_today` still reads the journal.
+    calls_today: int = Field(default=0, sa_column=Column("calls_today", Integer, nullable=False, server_default="0"))
+    calls_today_day: date | None = Field(default=None)
+    # Per-member tool ACL: NULL = ALL tools in the org (the default — no restriction, no regression); a
+    # JSON list of tool NAMES = the ONLY tools this member may call or run. See api._require_tool_access.
+    tool_access: list | None = Field(default=None, sa_column=Column("tool_access", JSON, nullable=True))
+    # Per-member PROJECT scope: NULL = the whole org (the default); a JSON list of project IDS = the
+    # only projects whose tools this member may use. IDs, not slugs, so the hot-path check stays a pure
+    # set test (no id→slug query per call) and a project rename can't strand an access list.
+    # Composes with tool_access as AND — see api._project_allowed.
+    project_access: list | None = Field(default=None, sa_column=Column("project_access", JSON, nullable=True))
+    # May this member use the LOCAL run tier (`treg run --local`, the grant)? False → server runs only.
+    local_run_enabled: bool = Field(default=True)
+    # A token minted for ONE tag value — `{"customer": "cust_A"}` — typically because it runs on that
+    # customer's own machine. The pin WINS over the request header for the dimensions it names (see
+    # api._parse_call_meta): otherwise whoever holds the token could retag their calls and walk straight out
+    # of their own budget, which is the entire point of giving them a scoped token. NULL = unpinned.
+    pinned_tags: dict | None = Field(default=None, sa_column=Column("pinned_tags", JSON, nullable=True))
+    created_at: NaiveUTC = Field(default_factory=_now)
+
+
+class ApiKey(SQLModel, table=True):
+    """One credential control record for a human or scoped-agent membership.
+
+    Hash-backed credentials keep only ``key_hash``. A default human record controls the stable
+    signed identity credential and therefore has no hash. ``membership_id`` becomes NULL when the
+    membership is removed; the saved identity label keeps audit and Activity readable.
+    """
+
+    __table_args__ = (
+        Index(
+            "uq_apikey_default_membership",
+            "membership_id",
+            unique=True,
+            postgresql_where=text("kind = 'default_human'"),
+            sqlite_where=text("kind = 'default_human'"),
+        ),
+        Index(
+            "uq_apikey_current_agent_membership",
+            "membership_id",
+            unique=True,
+            postgresql_where=text("kind = 'agent' AND state IN ('active', 'disabled')"),
+            sqlite_where=text("kind = 'agent' AND state IN ('active', 'disabled')"),
+        ),
+    )
+
+    id: int | None = Field(default=None, primary_key=True)
+    org_id: int = Field(foreign_key="org.id", index=True)
+    membership_id: int | None = Field(default=None, foreign_key="membership.id", index=True)
+    identity_label: str = Field(default="", index=True)
+    kind: str = Field(index=True)  # default_human | additional_human | legacy_human | agent
+    name: str
+    safe_prefix: str | None = Field(default=None)
+    key_hash: str | None = Field(default=None, index=True, unique=True)
+    state: str = Field(default="active", index=True)  # active | disabled | revoked
+    # Signed Default keys carry this per-team generation. Rotating increments it so only that
+    # membership's previously issued Default token stops working; no replacement row is needed.
+    default_generation: int = Field(default=0)
+    created_by: str = Field(default="")
+    created_at: NaiveUTC = Field(default_factory=_now)
+    last_used_at: NaiveUTC | None = Field(default=None)
+    disabled_at: NaiveUTC | None = Field(default=None)
+    revoked_at: NaiveUTC | None = Field(default=None)
+    deleted_at: NaiveUTC | None = Field(default=None)
+    replacement_key_id: int | None = Field(default=None)
+
+
+class ApiKeyEvent(SQLModel, table=True):
+    """Append-only key administration audit. It never contains complete secret material."""
+
+    id: int | None = Field(default=None, primary_key=True)
+    org_id: int = Field(foreign_key="org.id", index=True)
+    key_id: int = Field(foreign_key="apikey.id", index=True)
+    actor_email: str = Field(default="", index=True)
+    identity_label: str = Field(default="")
+    action: str = Field(index=True)
+    created_at: NaiveUTC = Field(default_factory=_now)
+
+
+class Invite(SQLModel, table=True):
+    """A one-time invite code (no email server yet). An admin creates it and shares the code
+    (Slack/DM); the invitee redeems it and mints their own org-scoped token. (Used by PR2.)
+
+    TWO secrets, deliberately split: `code_hash` is the admin-visible out-of-band code (returned
+    from POST /orgs/{id}/invites so it can be relayed via Slack/DM) — it lets you JOIN but never
+    signs you in, because the admin provably holds it. `email_token_hash` is a second secret that
+    ONLY travels inside the invite email's link: possession proves inbox access (the same bar as
+    the emailed OTP), so /auth/invite-signin may mint a session from it. One-time: nulled on use.
+    """
+
+    id: int | None = Field(default=None, primary_key=True)
+    org_id: int = Field(foreign_key="org.id", index=True)
+    email: str = Field(index=True)
+    role: str = Field(default="member")
+    code_hash: str = Field(index=True)
+    email_token_hash: str | None = Field(default=None, index=True)  # inbox-only sign-in secret (see docstring)
+    status: str = Field(default="pending")  # pending | accepted | revoked
+    invited_by: str = Field(default="")  # inviter email (audit)
+    expires_at: NaiveUTC | None = Field(default=None)  # one-time AND time-bounded; None = never
+    # Access to seed onto the membership when this invite is accepted (requirement: set access at invite
+    # time, modify later). NULL tool_access = all tools; a list = the allowed tool names.
+    tool_access: list | None = Field(default=None, sa_column=Column("tool_access", JSON, nullable=True))
+    # NULL = the whole org; a list of project IDS = the projects to scope them to (see Membership).
+    project_access: list | None = Field(default=None, sa_column=Column("project_access", JSON, nullable=True))
+    local_run_enabled: bool = Field(default=True)
+    # Where the invitee lands after sign-in — a shared detail page ("/app/skills/<name>") when the
+    # invite was minted from a share, else NULL for the plain dashboard. Path-only, validated on create.
+    landing: str | None = Field(default=None)
+    created_at: NaiveUTC = Field(default_factory=_now)
+
+
+class CallRecord(SQLModel, table=True):
+    """Audit: who called which tool, in which org, when, with what result. Written off the
+    request path (fire-and-forget) so it never adds latency to a proxied call.
+    """
+
+    # Partial index: the archive report counts cached=true rows (twice per refresh) over the
+    # biggest table in the database — without this it is two full scans per panel poll (measured
+    # 78s on prod at 425k archive keys, 2026-09-03). Partial because hits are a sliver of rows.
+    __table_args__ = (Index("ix_callrecord_cached_true", "cached",
+                            postgresql_where=text("cached"), sqlite_where=text("cached")),
+                      # The panel's per-endpoint event feed: "this endpoint's newest 30 calls".
+                      # Without the pair, the planner walked the WHOLE table backward via the
+                      # primary key, testing endpoint_id row by row — measured 7.5s per click on
+                      # prod (2026-09-03). With it, the same question is a 30-row index read.
+                      Index("ix_callrecord_endpoint_id_id", "endpoint_id", "id"),
+                      # EVERY question asked of this table is "… since <time>", and until now no
+                      # index carried `created_at`, so the planner picked an index for the other
+                      # column and filtered the date in memory, reading an endpoint's or an org's
+                      # whole history to answer a bounded time-window question.
+                      #
+                      # That load is why the API pool saturates: the three pools bulkhead
+                      # CONNECTIONS, not the one database's CPU, so a scan of this table makes
+                      # every 3 ms request query queue behind it until `pool_timeout` fires and
+                      # callers get `503 treg_saturated`. Sizing the pool cannot fix a scan.
+                      Index("ix_callrecord_endpoint_id_created_at", "endpoint_id", "created_at"),
+                      # The per-user daily call cap (`governance/usage.count_today`, on every
+                      # capped call): "this org, this member, since midnight". Without the triple
+                      # the planner BitmapAnd-ed the member's WHOLE history through
+                      # `ix_callrecord_user_email` - measured 2.6 s of 3.0 s on prod 2026-09-06 for
+                      # a member with 287k rows. Revision 0023 builds it concurrently.
+                      Index("ix_callrecord_org_id_user_email_created_at", "org_id", "user_email", "created_at"),
+                      Index("ix_callrecord_org_id_created_at", "org_id", "created_at"),
+                      # "This team's newest N" (0054): `/calls` pages by id; local runs are too
+                      # sparse for any org-wide index to find quickly, and page by time.
+                      Index("ix_callrecord_org_id_id", "org_id", "id"),
+                      Index("ix_callrecord_org_local_run", "org_id", "created_at", "id",
+                            postgresql_where=text("kind = 'local_run'"),
+                            sqlite_where=text("kind = 'local_run'")),
+                      Index("ix_callrecord_org_key_id", "org_id", "api_key_id", "id",
+                            postgresql_where=text("api_key_id IS NOT NULL"),
+                            sqlite_where=text("api_key_id IS NOT NULL")),)
+
+    id: int | None = Field(default=None, primary_key=True)
+    org_id: int | None = Field(default=None, foreign_key="org.id", index=True)
+    user_email: str = Field(index=True)
+    tool_name: str = Field(index=True)
+    method: str
+    path: str
+    status_code: int
+    # Execution path: "call", "async_poll" (owned free status read, hidden from Activity),
+    # or "local_run" (/tools/{name}/grant).
+    # Server-side CLI runs live in RunRecord ("server_run"). Lets the usage view break down by kind.
+    kind: str = Field(default="call")
+    # The RUNTIME that made the call — "claude-code", "codex", "cursor", … — self-reported by the
+    # treg CLI via X-Treg-Client (attribution, NOT authentication: anything holding the token can
+    # claim any name). "" = unreported. What makes the observed-agents roster possible.
+    client: str = Field(default="", index=True)
+    # The key snapshot used for this call. Historical rows before managed-key tracking keep NULL.
+    # Logical reference only: Activity must survive key and membership lifecycle changes.
+    api_key_id: int | None = Field(default=None)
+    api_key_name: str | None = Field(default=None)
+    api_key_prefix: str | None = Field(default=None)
+    # ---- marketplace telemetry (NULL on a plain tool call) -------------------------------------
+    # What a direct catalog call actually did: which endpoint, whose credential paid for it, what we
+    # expected it to cost vs what the provider said it cost, and how big/slow the answer was. The
+    # money itself is NOT here — it landed synchronously in the ledger (see domain/money); this table is
+    # analytics and is allowed to lose rows.
+    endpoint_id: str | None = Field(default=None, index=True)
+    provider: str | None = Field(default=None, index=True)
+    # tool | credential | platform — which rung of the credential ladder served it. "platform" is the
+    # only one that spends treg's own money, so this is what a spend audit groups by.
+    credential_tier: str | None = Field(default=None)
+    cost_estimated_micro: int | None = Field(default=None)  # what reserve withheld (platform tier only)
+    cost_observed_micro: int | None = Field(default=None)   # the provider's own reported charge, when it reports one
+    # What actually hit the org's balance: the settle amount, or 0 on a release/402/429. The estimate
+    # alone over-reports a released call as spend, so displays must prefer this when present.
+    cost_charged_micro: int | None = Field(default=None)
+    duration_ms: int | None = Field(default=None)
+    response_bytes: int | None = Field(default=None)
+    # sha256 of endpoint_id + the canonicalized query + body — an identity for "the same call again".
+    # The hash itself never carries a body, so it is safe to keep forever; it is the future cache key
+    # and the repeat-rate signal (plan phase 5). For the ONE case where a body IS retained, see
+    # `error_request` below — it is deliberately narrow and does not weaken this column's guarantee.
+    params_hash: str | None = Field(default=None, index=True)
+    # ---- failure evidence (NULL unless a relayed call failed) ---------------------------------
+    # The only place treg retains request or response CONTENT, and the exception to "bodies are not
+    # stored". Written on failed marketplace, own-key, and plain own-tool calls under the sanctioned
+    # reversal of PR #139: production failures without the provider's answer cannot be diagnosed.
+    # Never written for a success, and never exposed by the team-facing `/calls` route.
+    #
+    # Both are REDACTED and TRUNCATED at the point of capture (see api._secret_renderings): every
+    # injected credential is exact-matched out first, then known third-party secret shapes. They are
+    # evidence for a human, never an exact replay — `error_request` cannot reconstruct the call.
+    # Both are overwritten with '<expired>' once past the retention window, so "captured then aged
+    # out" stays distinguishable from "never captured".
+    error_request: str | None = Field(default=None)
+    error_response: str | None = Field(default=None)
+    # Set when TREG refused the call before a byte went upstream; NULL when the provider answered
+    # (whatever its status). Values: auth (bad/expired token) | policy (ACL/deny rule/suspension) |
+    # balance (402 insufficient prepaid balance) | cap (429 daily caps) | resolution (no such tool
+    # or endpoint) | request (malformed pre-relay: wrong method, missing param, bad body). What
+    # separates "the provider failed" from "we said no" — without it a paywall 402 is
+    # indistinguishable from a provider error, and provider stats absorb our own refusals.
+    refused_by: str | None = Field(default=None, index=True)
+    # ---- caller tags (X-Treg-Meta) -------------------------------------------------------------
+    # A builder reselling treg tags each call with their OWN ids ("customer=cust_8123,
+    # workspace=ws_9") so they can attribute, budget and invoice their users. `tags` is the whole
+    # bag; `budget_dim`/`budget_val` are the indexed copy of the org's PRIMARY dimension, which is
+    # what a per-tag report groups by without folding JSON (see ledger.TagSpend for the money side).
+    # "" — never NULL — because NULLs are distinct in a unique index on both engines.
+    # Echoed to the caller as X-Treg-Call-Id and used as the ledger call_id on a metered call, so a
+    # builder can join this row, the money rows and their OWN records on one value.
+    call_ref: str = Field(default="", index=True)
+    budget_dim: str = Field(default="")
+    budget_val: str = Field(default="", index=True)
+    tags: dict | None = Field(default=None, sa_column=Column("tags", JSON, nullable=True))
+    created_at: NaiveUTC = Field(default_factory=_now)
+    # True when the archive served this answer instead of the vendor (X-Treg-Cache: hit).
+    # Money columns stay identical to a live call on purpose — pricing a hit is a deferred
+    # founder decision (docs/context/architecture/archive.md). Declared LAST to match the
+    # migration's ALTER TABLE ADD COLUMN append position.
+    cached: bool = Field(default=False)
+    # Did the provider FIND something? Decided at settle from the response body by the endpoint's
+    # routing adapter (`catalog/adapters.yaml` `miss`), never stored as content — only the verdict.
+    # An accepted async submission stays NULL until terminal evidence arrives; the task row
+    # retains that verdict across an audit insert race.
+    # NULL = no adapter could tell (or the call failed). Feeds `stats.observed` `hit_rate`, the
+    # P(hit) of the router's expected-cost-per-hit ranking.
+    hit: bool | None = Field(default=None)
+    # The archive identities of the answer this call received — `ArchiveKey.key_hash` (the
+    # question) and `ArchiveSnapshot.content_hash` (the exact bytes) — set only when the archive
+    # recorded or served it, i.e. metered platform 2xx calls while recording is on. The join
+    # behind the team-facing `/calls/{id}/result`. Not indexed on purpose: the read starts from
+    # this row by id and both targets carry their own index. Last columns (alembic appends).
+    archive_key_hash: str | None = Field(default=None)
+    archive_content_hash: str | None = Field(default=None)
+    # The provider's share of `duration_ms` (set by the call path; see `upstream_ms` there): the
+    # request until its answer is read. NULL when no request reached the provider, and on rows
+    # written before the column existed.
+    upstream_ms: int | None = Field(default=None)
+    # The contract's verdict word for this answer (`catalog/contracts.yaml` `verdict`): `valid`,
+    # `catch_all`, `unknown`... for a verify, `verified`/`unverified` for a find. Set where `hit`
+    # is, by the same adapter, and like `hit` copied from the task row for an async submission.
+    # NULL = the contract records no verdict, the answer carried none, or the provider used a
+    # word its adapter does not map. Never content: one word from a closed list.
+    verdict: str | None = Field(default=None)
+
+
+class RunRecord(SQLModel, table=True):
+    """Audit for server-side CLI runs (`treg run`): who ran which tool's CLI, with what args, in
+    which org, and the result. Written off the request path (fire-and-forget) like CallRecord.
+    `argv` never contains a secret value (secrets are injected via env, not the command line).
+    """
+
+    __table_args__ = (
+        Index("ix_runrecord_org_key_id", "org_id", "api_key_id", "id",
+              postgresql_where=text("api_key_id IS NOT NULL"),
+              sqlite_where=text("api_key_id IS NOT NULL")),
+    )
+
+    id: int | None = Field(default=None, primary_key=True)
+    org_id: int | None = Field(default=None, foreign_key="org.id", index=True)
+    user_email: str = Field(index=True)
+    bundle_name: str = Field(index=True)  # the TOOL name since the tool-side unification (column name is historical)
+    argv: list = Field(default_factory=list, sa_column=Column("argv", JSON))
+    exit_code: int
+    duration_ms: int
+    client: str = Field(default="")  # runtime attribution, same contract as CallRecord.client
+    api_key_id: int | None = Field(default=None)
+    api_key_name: str | None = Field(default=None)
+    api_key_prefix: str | None = Field(default=None)
+    created_at: NaiveUTC = Field(default_factory=_now)
+
+    # Attribution snapshot: never infer ownership from a current membership or lossy audit.
+    tags: dict | None = Field(default=None, sa_column=Column("tags", JSON, nullable=True))
+
+
+class Bundle(SQLModel, table=True):
+    """A skill: the named grouping of a recipe (SKILL.md) + its secrets + its tool(s) — pure
+    packaging. "Register a skill" creates a bundle; its secrets/tools point back via `bundle_id`.
+
+    Execution config (both `treg run` tiers) lives on `Tool.cli` — one profile, read by the local
+    grant path and the server runner alike (see docs/CLI-RUN-PLAN.md). The old bundle-side run
+    columns (runtime/package/entrypoint/runnable) were folded into `Tool.cli` by a startup
+    migration; they may still exist physically in older databases but nothing reads them.
+    """
+
+    id: int | None = Field(default=None, primary_key=True)
+    org_id: int | None = Field(default=None, foreign_key="org.id", index=True)
+    name: str = Field(index=True)
+    owner: str = Field(default="bootstrap", index=True)  # creator email (audit)
+    recipe: str = Field(default="")  # the SKILL.md text (the shareable how-to)
+    # Companion files so a whole skill folder travels, not just SKILL.md: {relpath: text-content},
+    # nested paths allowed (e.g. "reference/fields.md", "scripts/run.py"). Excludes secrets + binaries;
+    # `skill install` reconstructs the tree. Text only — a skill folder is assumed small.
+    files: dict = Field(default_factory=dict, sa_column=Column("files", JSON))
+    created_at: NaiveUTC = Field(default_factory=_now)
+
+
+class Ephemeral(SQLModel, table=True):
+    """Short-lived server state that must survive a restart and stay correct across instances:
+    the emailed OTP code + its brute-force counter, and the auth rate-limit sliding windows. Keyed
+    by (ns, k) — a namespace ('otp' | 'otp_start' | 'sandbox_hit') plus the key within it; `v` is an
+    opaque JSON payload; rows past `expires_at` are swept lazily (see treg.ratestore). This is the
+    DB home for what used to be per-process dicts (backlog #3) — so counters can't be reset by a
+    restart and stay correct on more than one instance. NOT the CLI-login handshake, which is
+    deliberately still in-process (short-lived, self-heals on retry — see api._cli_pending)."""
+
+    ns: str = Field(primary_key=True)
+    k: str = Field(primary_key=True)
+    v: dict = Field(default_factory=dict, sa_column=Column("v", JSON, nullable=False))
+    expires_at: NaiveUTC = Field(index=True)
+
+
+class PendingOAuth(SQLModel, table=True):
+    """An in-flight OAuth connect (Phase C). `state` is the unguessable lookup/CSRF key carried
+    through the provider redirect. `client_secret` is encrypted at rest. On callback we exchange
+    the code for tokens and create the resulting oauth Secret (in `org_id`), then mark this done.
+    """
+
+    id: int | None = Field(default=None, primary_key=True)
+    org_id: int | None = Field(default=None, foreign_key="org.id", index=True)
+    state: str = Field(index=True, unique=True)
+    name: str
+    owner: str = Field(index=True)
+    client_id: str
+    client_secret: str  # encrypted
+    auth_uri: str
+    token_uri: str
+    scopes: str = ""  # space-joined
+    redirect_uri: str
+    # The registry service this connect came from ("" for a bring-your-own-app connect). Carried
+    # through the redirect so the callback knows which provider's tool to auto-provision.
+    provider: str = Field(default="")
+    # One catalog provider can have more than one explicit OAuth grant. Instagram uses a
+    # direct Instagram grant by default and a separate Facebook Page grant for Page-only tools.
+    authorization_method: str = Field(default="")
+    # Per-provider auth quirks, captured at start so the callback exchanges the code the same way
+    # the consent URL was built. `code_verifier` is PKCE (empty = not used); `auth_params` is a JSON
+    # object of extra consent-URL query params.
+    code_verifier: str = Field(default="")
+    auth_params: str = Field(default="")
+    token_endpoint_auth_method: str = Field(default="client_secret_post")
+    # TikTok spells the client identifier `client_key` and comma-joins scopes. Snapshotted here for
+    # the same reason as the fields above: the callback must speak the dialect the consent URL used.
+    client_id_param: str = Field(default="client_id")
+    scope_separator: str = Field(default=" ")
+    # Meta only: swap the short-lived code-exchange token for a ~60-day one before storing it.
+    # Snapshotted for the same reason as the fields above — the callback must not have to look the
+    # provider up again to know how the token was meant to be obtained.
+    long_lived_exchange: bool = Field(default=False)
+    # Empty keeps the legacy boolean behavior. "instagram" uses Instagram's ig_exchange_token
+    # endpoint and records its renewable long-lived-token protocol in the encrypted blob.
+    long_lived_exchange_style: str = Field(default="")
+    # Which existing connection this consent is REPLACING, if any. Set when the user reconnects or
+    # widens access on a specific account; left null when they are adding another one. Without it
+    # the callback cannot tell "renew this Slack workspace" from "attach a second Slack workspace",
+    # and has to guess — which is why it used to blanket-replace by provider.
+    replaces_secret_id: int | None = Field(default=None)
+    status: str = Field(default="pending")  # pending | done | error
+    secret_id: int | None = Field(default=None)
+    detail: str = Field(default="")
+    created_at: NaiveUTC = Field(default_factory=_now)
+
+
+class Secret(SQLModel, table=True):
+    """A stored credential blob. `value` is Fernet-encrypted (see crypto.py).
+
+    `kind` selects the injector used at call time (env | secret_file | cli_auth | oauth).
+    """
+
+    id: int | None = Field(default=None, primary_key=True)
+    org_id: int | None = Field(default=None, foreign_key="org.id", index=True)
+    name: str = Field(index=True)
+    owner: str = Field(default="bootstrap", index=True)  # creator email (audit)
+    kind: str = Field(default="env")
+    value: str  # encrypted at rest; never returned to clients
+    bundle_id: int | None = Field(default=None, foreign_key="bundle.id", index=True)
+    # Freshness/validity — set by the health runner (Phase B). status: unknown | ok | invalid.
+    health_status: str = Field(default="unknown")
+    health_detail: str = Field(default="")
+    health_checked_at: NaiveUTC | None = Field(default=None)
+
+    # Connection metadata (registry connects — see oauth_providers.py). Empty `provider` means this
+    # credential did not come from the registry (uploaded, or a bring-your-own-app connect).
+    provider: str = Field(default="", index=True)
+    # The explicit grant that minted this credential. Kept separate from provider so two grants for
+    # one logical provider never overwrite or impersonate each other.
+    authorization_method: str = Field(default="", index=True)
+    granted_scopes: str = Field(default="")  # space-joined; what the user ACTUALLY consented to
+    resource_ref: str = Field(default="")  # the chosen site / property / account this connection acts on
+    # The human name for that ref. Upstream ids are opaque ("properties/384078430"); showing one to
+    # a user tells them nothing about which site they picked, so the label is stored alongside it.
+    resource_name: str = Field(default="")
+
+    # Expiry is a SEPARATE axis from health_status. health answers "does this credential work";
+    # expiry answers "how long will it keep working". A non-refreshable token (LinkedIn issues no
+    # refresh_token at the non-partner tier) is perfectly healthy right up until it silently dies,
+    # so it has to be surfaced on its own or the user gets no warning at all.
+    expires_at: NaiveUTC | None = Field(default=None)
+    last_refresh_at: NaiveUTC | None = Field(default=None)
+    last_error: str = Field(default="")
+
+    created_at: NaiveUTC = Field(default_factory=_now)
+
+
+class AdConversion(SQLModel, table=True):
+    """One conversion owed to Google Ads — an OUTBOX row, not a log line.
+
+    Written synchronously inside the transaction of the event it describes, so the event and its
+    pending conversion commit or fail together — true for `signup` (queued alongside the grant;
+    `_grant_signup_promo`'s single commit lands both) and `first_call` (queued and committed on its
+    own dedicated session). It is NOT true for `paid`: `_credit` commits the credit immediately after
+    `ledger.topup()` stages it, before queueing the conversion, so a crash between the two commits
+    loses that conversion permanently. This
+    gap is a known, accepted trade-off (2026-08-17) rather than a reason to restructure `domain/money` —
+    see `docs/context/architecture/ads-conversions.md`. A background worker uploads every row later;
+    until then `uploaded_at` is NULL. The unique constraint on (org_id, action) is what makes every
+    fire site idempotent — a webhook redelivery or a retried signup bounces off it instead of
+    double-counting.
+    """
+
+    __table_args__ = (UniqueConstraint("org_id", "action", name="uq_adconversion_org_action"),)
+
+    id: int | None = Field(default=None, primary_key=True)
+    org_id: int = Field(index=True, foreign_key="org.id")
+    action: str  # adsconv.ACTION_* — "signup" | "first_call" | "paid"
+    dedupe_key: str = Field(default="")  # provenance (e.g. the Stripe PaymentIntent id); not the key
+    value_usd_micro: int = Field(default=0)  # converted to AUD at upload time, never stored as AUD
+    # Naive UTC (no tzinfo): columns are TIMESTAMP WITHOUT TIME ZONE, and Postgres rejects tz-aware
+    # values into naive columns. Use _now (defined above) to stay consistent with other tables.
+    created_at: NaiveUTC = Field(default_factory=_now)
+    uploaded_at: NaiveUTC | None = Field(default=None, index=True)
+    # Retryable failures wait here with exponential backoff. Terminal per-row failures keep the
+    # outbox row and error for inspection rather than being mislabeled as uploaded or disappearing.
+    next_attempt_at: NaiveUTC | None = Field(default=None, index=True)
+    failed_at: NaiveUTC | None = Field(default=None, index=True)
+    attempts: int = Field(default=0)
+    error: str = Field(default="")
+
+
+class Tool(SQLModel, table=True):
+    """A registered capability: a name + an upstream base + a LIST of credential bindings.
+
+    The proxy *relays* — it never models the upstream. Each binding in `bindings` is one
+    injection applied to every call: {secret_id, injector, location, name, format, secret_field}.
+    A request may carry several (e.g. google-ads: OAuth bearer + developer-token header). A
+    binding's secret may be one another member uploaded (use-without-hold). `name` is unique
+    per org (two orgs may register the same tool name).
+    """
+
+    __table_args__ = (UniqueConstraint("org_id", "name", name="uq_tool_org_name"),)
+
+    id: int | None = Field(default=None, primary_key=True)
+    org_id: int | None = Field(default=None, foreign_key="org.id", index=True)
+    name: str = Field(index=True)
+    owner: str = Field(default="bootstrap", index=True)  # creator email (audit)
+    base_url: str  # e.g. https://us.posthog.com
+    host: str = Field(default="", index=True)  # netloc of base_url — indexed for URL-passthrough resolution
+    bindings: list[dict] = Field(default_factory=list, sa_column=Column(JSON))
+    # Optional usage examples surfaced in the dashboard: [{method, path, note}]. Per-tool, since
+    # every upstream differs. Filled from a skill's treg.json `examples` (or set via tool add/update).
+    examples: list[dict] = Field(default_factory=list, sa_column=Column("examples", JSON))
+    # Optional health probe: {method, path, expect_status} — the runner calls it to validate creds.
+    health_check: dict | None = Field(default=None, sa_column=Column("health_check", JSON))
+    # Optional local-run profile (`treg run`): {enabled, bin, inject[], deny[], deny_defaults,
+    # noninteractive}. Creator-declared via treg.json `cli` (enabled=true) or catalog-attached
+    # (disabled until the owner opts in). See docs/CLI-RUN-PLAN.md.
+    cli: dict | None = Field(default=None, sa_column=Column("cli", JSON))
+    bundle_id: int | None = Field(default=None, foreign_key="bundle.id", index=True)
+    # Optional sub-scope inside the org. NULL = ORG-WIDE — which is every tool that existed before
+    # projects, so adding this changed nothing. A project is a LABEL + ACL scope, never a namespace:
+    # `name` stays unique per (org_id, name), so no unique constraint had to be rebuilt. See models.Project.
+    project_id: int | None = Field(default=None, foreign_key="project.id", index=True)
+    created_at: NaiveUTC = Field(default_factory=_now)
+
+
+class CapabilityPin(SQLModel, table=True):
+    """"For THIS job, our team uses THIS provider." One row per (org, capability).
+
+    Not expressible as a DenyRule. A deny is negative and closed — blocking the other eight providers
+    of a capability leaves the ninth allowed by accident the day a tenth is added to the catalog. A
+    pin is positive and stays correct as the catalog grows.
+
+    It is a real gate, not a hint: a catalog call to a DIFFERENT provider of a pinned capability is
+    refused, naming the endpoint the team does use. A hint would be honoured by a well-behaved agent
+    and ignored by the one you actually needed to stop — and the point of team policy is that it does
+    not depend on the caller's goodwill.
+
+    Deliberately per-capability, not per-provider: "we use Hunter for finding work emails" is a
+    decision a team can hold in its head, whereas "we use Hunter" says nothing about the twelve other
+    jobs Hunter also happens to serve.
+
+    **Boundary — a pin governs the CATALOG, not every route to a vendor.** It is enforced where an
+    endpoint is addressed by its catalog id, which is the only way to reach treg's own key, so it
+    cannot be side-stepped to spend OUR money. A team that holds its own key for another provider can
+    still call that provider by upstream URL: that is their credential and their bill, and blocking
+    it is what `DenyRule` (host-scoped, applied to every shape of call) is for. Two tools, two jobs.
+    """
+
+    # UNIQUE(org_id, capability): `set_capability_pin` is a SELECT then an INSERT, so two admins
+    # pinning the same job at once — or one admin against two web workers — would write two rows.
+    # Enforcement would then read them with scalar_one_or_none() and raise MultipleResultsFound,
+    # turning a policy row into a 500 on EVERY call to that capability. Same shape as the
+    # double-credit bug in ledger.topup (#45): the database has to be the one that says no.
+    __table_args__ = (UniqueConstraint("org_id", "capability", name="uq_pin_org_capability"),)
+
+    id: int | None = Field(default=None, primary_key=True)
+    org_id: int = Field(foreign_key="org.id", index=True)
+    capability: str = Field(index=True)         # e.g. "people.email.find"
+    provider: str                               # a catalog provider service id, e.g. "hunter"
+    created_by: str = Field(default="")         # the admin who set it — pins outlive their author
+    created_at: NaiveUTC = Field(default_factory=_now)
+
+
+class DenyRule(SQLModel, table=True):
+    """A policy rule evaluated on every proxied call: block this host / path / method.
+
+    treg now denies at three layers, deliberately kept apart because each sees something different:
+      - `egress.py`   — the OS firewall around an isolated LOCAL run (which hosts that uid may reach),
+      - `localrun.check_deny` — the ARGV of a local CLI run (`--live`, `auth token`, …),
+      - **this**      — the HTTP request the PROXY is about to relay (host + path + method).
+
+    Scope: `user_id` NULL = the whole org; set = only that member (so one agent can be held tighter
+    than the rest of the team). An empty `host`/`path_prefix`/`method` means "any" — so a rule with
+    only `method="DELETE"` blocks every delete in the org.
+
+    `verdict` is `deny` today. It exists so approval-required actions ("hold the call, ask a human")
+    can land in this same table later without a migration — mirroring the `verdict` vocabulary
+    `localrun.py` already uses for its argv errors.
+    """
+
+    id: int | None = Field(default=None, primary_key=True)
+    org_id: int | None = Field(default=None, foreign_key="org.id", index=True)
+    # NULL = applies to everyone in the org. Set = only this member/agent (identified the same way
+    # every other member endpoint does, by user id — org_id + user_id IS the membership).
+    user_id: int | None = Field(default=None, foreign_key="user.id", index=True)
+    # NULL = applies to any tool. Set = only calls made THROUGH a tool in this project — the third
+    # optional scope axis, composed with user_id as AND (both NULL-means-any, like project_access).
+    # A URL-passthrough call resolves to a tool first, so it carries a project too.
+    project_id: int | None = Field(default=None, foreign_key="project.id", index=True)
+    host: str = Field(default="")  # netloc, case-insensitive; "" = any host
+    path_prefix: str = Field(default="")  # "" = any path
+    method: str = Field(default="")  # "" = any method
+    verdict: str = Field(default="deny")  # deny | approve (approve = reserved, see docstring)
+    note: str = Field(default="")  # why this exists — shown in the refusal so it names its source
+    created_by: str = Field(default="")  # admin email (audit)
+    created_at: NaiveUTC = Field(default_factory=_now)
+
+
+class CreditBlock(SQLModel, table=True):
+    """One funding event's worth of credit — a promo grant or a purchase — and what's left of it.
+
+    Blocks rather than a single scalar balance because the FUNDING SOURCE has to survive: purchased
+    credit is a deferred-revenue liability and refundable, promotional credit is a marketing expense
+    and never refundable. Spend therefore burns promotional-first, then oldest-purchased-first
+    (ledger.settle), which also keeps the refundable pool as small as possible.
+
+    `remaining_micro` is decremented only by settles. `expires_at` is unused today (promo credit has
+    no expiry yet) — it exists so adding one is a policy change, not a migration.
+    """
+
+    id: str = Field(primary_key=True)  # uuid4 hex
+    org_id: int = Field(foreign_key="org.id", index=True)
+    kind: str = Field(default="promotional", index=True)  # promotional | purchased
+    amount_micro: int  # granted amount, micro-USD (1e-6 USD) — never mutated
+    remaining_micro: int  # what's left to spend from this block
+    currency: str = Field(default="USD")
+    expires_at: NaiveUTC | None = Field(default=None)
+    # The already-authorized payment this block was funded by (phase 4). Doubles as the idempotency
+    # key for ledger.topup — a redelivered webhook must not credit twice. **UNIQUE**, because the
+    # check in `topup` is a SELECT then an INSERT: two concurrent deliveries of the same PaymentIntent
+    # both find nothing and both credit. Stripe delivers at least once, retries after the 500 the
+    # handler deliberately returns, and prod can run more than one instance — so the database has to
+    # be the one that says no. NULL is exempt from a unique index, so promo blocks are unaffected.
+    stripe_payment_intent: str | None = Field(
+        default=None, index=True, sa_column_kwargs={"unique": True})
+    created_at: NaiveUTC = Field(default_factory=_now)
+
+
+class LedgerEntry(SQLModel, table=True):
+    """APPEND-ONLY money journal: every balance/block movement writes exactly one row, in the same
+    transaction as the movement itself. Nothing edits or deletes a row — a correction is a new
+    compensating entry. This is the audit trail we reconcile against the provider's own bill, so it
+    is written SYNCHRONOUSLY in-request and never through `audit.py` (which drops rows past its
+    queue bound and swallows exceptions — right for analytics, fatal for money).
+
+    `amount_micro` is SIGNED from the org's point of view: a grant/topup/release is positive, a
+    reserve/settle is negative. `call_id` correlates the reserve→settle / reserve→release pair.
+    """
+
+    # `(org_id, created_at)` is what EVERY metered call pays for: `ledger.spent_today` (the
+    # fail-closed daily cap, inside the reserve transaction on an api-pool connection) asks
+    # "this org, since midnight". With only single-column indexes the planner walked the whole
+    # platform's day and filtered the org in memory - measured on prod 2026-09-06 at 4.38M rows:
+    # 322k rows discarded and 381k buffer touches per call, 56-106 s once the day's pages were
+    # cold, each one holding an api-pool slot. That was the `503 treg_saturated` mechanism, and
+    # this table (not `callrecord`) was the largest IO consumer in the database. The pair also
+    # serves `entries_of` (`/billing`), which had walked the whole `created_at` index backward.
+    # Revision 0021 builds it concurrently.
+    __table_args__ = (Index("ix_ledgerentry_org_id_created_at", "org_id", "created_at"),)
+
+    id: str = Field(primary_key=True)  # uuid4 hex
+    org_id: int = Field(foreign_key="org.id", index=True)
+    block_id: str | None = Field(default=None, index=True)
+    # grant | topup | reserve | settle | release | refund | adjustment | expiry
+    kind: str = Field(index=True)
+    amount_micro: int  # signed (see docstring)
+    call_id: str | None = Field(default=None, index=True)
+    endpoint_id: str | None = Field(default=None)
+    # Free-form provenance: estimated vs observed cost, the margin applied, payment ref, shortfalls.
+    meta: dict = Field(default_factory=dict, sa_column=Column("meta", JSON))
+    created_at: NaiveUTC = Field(default_factory=_now, index=True)
+
+
+class Hold(SQLModel, table=True):
+    """An OPEN reservation: money taken out of `Org.balance_micro` for a call that hasn't finished.
+
+    `id` IS the call_id, so the settle/release that closes it needs no second lookup. Rows are
+    deleted on settle/release, which makes the table a live list of in-flight spend — and lets the
+    reaper (ledger.reap_stale_holds) find the ones a crash between relay and settle stranded. A hold
+    referenced by a pending AsyncTaskRecord is deliberately excluded until its worker resolves it.
+    """
+
+    id: str = Field(primary_key=True)  # == call_id
+    org_id: int = Field(foreign_key="org.id", index=True)
+    endpoint_id: str = Field(default="")
+    amount_micro: int  # what was withheld from the balance (margin already applied)
+    created_at: NaiveUTC = Field(default_factory=_now, index=True)
+
+
+class AsyncTaskRecord(SQLModel, table=True):
+    """A metered async submission whose existing ledger hold awaits terminal evidence."""
+
+    call_id: str = Field(primary_key=True)  # Hold.id and the public X-Treg-Call-Id
+    org_id: int = Field(foreign_key="org.id", index=True)
+    provider: str = Field(index=True)
+    endpoint_id: str = Field(index=True)
+    task_id: str | None = Field(default=None, index=True)
+    # A fetch-mode descriptor may expose a different provider id after success (MiniMax file_id).
+    # It is learned only from an org-authorized terminal poll or the settlement worker.
+    result_id: str | None = Field(default=None, index=True)
+    poll_url: str | None = Field(default=None)
+    reserved_micro: int
+    descriptor: dict = Field(default_factory=dict, sa_column=Column("descriptor", JSON, nullable=False))
+    # Freezes the whole price rule with the request it was applied to, so a settlement replays
+    # from this row alone, whatever the catalog says by the time the task finishes.
+    settlement_basis: dict = Field(
+        default_factory=dict, sa_column=Column("settlement_basis", JSON, nullable=False))
+    created_at: NaiveUTC = Field(default_factory=_now, index=True)
+    next_check_at: NaiveUTC = Field(index=True)
+    attempts: int = Field(default=0)
+    consecutive_failures: int = Field(
+        default=0, sa_column=Column(Integer, nullable=False, server_default="0"))
+    status: str = Field(default="pending", index=True)
+    error: str = Field(default="")
+    settled_micro: int | None = Field(default=None)
+    # Final contact verdict. Durable here so a fast poll can finish before the best-effort
+    # CallRecord writer inserts the submission row.
+    hit: bool | None = Field(default=None)
+    completed_at: NaiveUTC | None = Field(default=None, index=True)
+
+    # Attribution snapshot: never infer ownership from a current membership or lossy audit.
+    tags: dict | None = Field(default=None, sa_column=Column("tags", JSON, nullable=True))
+    # The terminal answer's verdict word, kept with `hit` for the same insert race.
+    verdict: str | None = Field(default=None)
+
+
+class AsyncResourceRecord(SQLModel, table=True):
+    """An opaque object created on a shared provider account and owned by one org."""
+
+    __table_args__ = (
+        UniqueConstraint(
+            "org_id", "provider", "resource_kind", "resource_id",
+            name="uq_asyncresource_org_provider_kind_id",
+        ),
+    )
+
+    id: int | None = Field(default=None, primary_key=True)
+    org_id: int = Field(foreign_key="org.id", index=True)
+    provider: str = Field(index=True)
+    resource_kind: str = Field(index=True)
+    resource_id: str = Field(index=True)
+    source_call_id: str = Field(index=True)
+    created_at: NaiveUTC = Field(default_factory=_now, index=True)
+
+    # Attribution snapshot: never infer ownership from a current membership or lossy audit.
+    tags: dict | None = Field(default=None, sa_column=Column("tags", JSON, nullable=True))
+
+
+class ProviderResource(SQLModel, table=True):
+    """A durable object created with treg's shared provider credential for one organization.
+
+    Unlike ``AsyncResourceRecord`` (short-lived poll/fetch ids), these rows are user-visible
+    resources with a lifecycle: voices today, and later phone numbers or mailboxes.  BYOK objects
+    never enter this table because the provider account already supplies their tenancy boundary.
+    """
+
+    __table_args__ = (
+        UniqueConstraint(
+            "provider", "resource_kind", "upstream_id",
+            name="uq_providerresource_provider_kind_upstream",
+        ),
+        Index(
+            "ix_providerresource_org_provider_kind_status",
+            "org_id", "provider", "resource_kind", "status",
+        ),
+    )
+
+    id: int | None = Field(default=None, primary_key=True)
+    org_id: int = Field(foreign_key="org.id", index=True)
+    provider: str = Field(index=True)
+    resource_kind: str = Field(index=True)
+    upstream_id: str = Field(index=True)
+    display_name: str = Field(default="")
+    created_by: str = Field(default="")
+    source_call_id: str = Field(default="", index=True)
+    status: str = Field(default="active", index=True)  # active | deleted
+    created_at: datetime = Field(default_factory=_now, index=True)
+    updated_at: datetime = Field(default_factory=_now)
+    deleted_at: datetime | None = Field(default=None, index=True)
+
+
+class TagSpend(SQLModel, table=True):
+    """What one call cost, attributed to ONE of its caller tags. Written by `domain/money` only, inside
+    the same transaction as the money movement — never through `audit.py`, which drops rows.
+
+    A builder reselling treg tags each call (`customer=cust_8123, workspace=ws_9`) and needs two
+    things this table provides and JSON cannot: a per-call budget check that is an INDEXED aggregate
+    (a Python fold over a day of ledger rows, per request, is the first thing that melts under a
+    successful builder), and an invoice they can defend. `reconcile.py` checks these sums against the
+    ledger so a divergence is caught rather than discovered on a customer's bill.
+
+    ONE ROW PER TAG, each carrying the FULL call amount — the same dollar appears under `customer`
+    and under `workspace`, exactly like cloud cost-allocation tags. So summing WITHIN a dimension
+    reconciles to the org total, and summing ACROSS dimensions deliberately double-counts.
+
+    `amount_micro` tracks the hold: the estimate while in flight, rewritten to the consumed figure at
+    settle, and the row is deleted on release. A cap therefore counts in-flight work at its estimate
+    and errs toward refusing, which is the right direction for money.
+    """
+
+    __table_args__ = (Index("ix_tagspend_org_dim_val_created", "org_id", "dim", "val", "created_at"),)
+
+    id: int | None = Field(default=None, primary_key=True)
+    org_id: int = Field(foreign_key="org.id", index=True)
+    dim: str  # the tag key, e.g. "customer"
+    val: str  # the tag value, e.g. "cust_8123"
+    # The hold this belongs to (== call_id). Kept after settle so a row can be traced back to its call.
+    hold_id: str = Field(index=True)
+    # False while the hold is open (amount is the ESTIMATE), True once settled (amount is CONSUMED).
+    # An invoice reads settled rows only: an open hold is not spend, and billing it double-counts when
+    # it settles. A cap reads both.
+    settled: bool = Field(default=False)
+    amount_micro: int = Field(default=0)
+    created_at: NaiveUTC = Field(default_factory=_now, index=True)
+
+
+class TagBudget(SQLModel, table=True):
+    """One builder-set limit on one tag value — `customer/cust_8123 = $5/day`.
+
+    Keyed by (dim, val), so a call tagged `customer=cust_8123, workspace=ws_9` is checked against BOTH
+    rows and budgets stack: a $50/day workspace and a $5/day user inside it are two rows, not a
+    special case. The refusal names which one breached, because a builder running stacked budgets
+    otherwise cannot tell them apart.
+
+    Doubles as the REGISTRY that bounds cardinality. A row appears on first sighting of a pair, and
+    only that miss path counts rows against the per-dimension limit — steady state is one indexed
+    lookup. Builders never pre-register: no row means unlimited. Bounding at write is the only place
+    it can be done, because a limit checked at report time is checked after the rows already exist.
+
+    NOT a balance. One org, one balance; this table sets ceilings on a shared pot and never holds
+    money of its own.
+    """
+
+    __table_args__ = (UniqueConstraint("org_id", "dim", "val", name="uq_tagbudget_org_dim_val"),)
+
+    id: int | None = Field(default=None, primary_key=True)
+    org_id: int = Field(foreign_key="org.id", index=True)
+    dim: str
+    # The tag value this row governs, or `*` for the DIMENSION'S DEFAULT — the limit every value of
+    # `dim` inherits unless it has an override. `*` can never collide with a real tag: the value
+    # charset is [A-Za-z0-9._:-], so no caller can ever send it.
+    val: str
+    # True for a row the REGISTRY created on first sighting of a value (which is what keeps the
+    # cardinality check a cheap lookup). Such a row is bookkeeping, not a decision: resolution skips
+    # it so the dimension's default still applies, and the budgets list hides it. Setting any limit
+    # on it flips this to False and makes it a real override.
+    auto: bool = Field(default=False)
+    # NULL = no ceiling on this axis. Caps are SOFT (see api._enforce_tag_budgets): the figure they
+    # test is an aggregate, not a materialized column, so concurrent calls can overshoot slightly.
+    daily_cap_micro: int | None = Field(default=None)
+    monthly_cap_micro: int | None = Field(default=None)
+    calls_per_day: int = Field(default=-1)  # -1 = unlimited, mirroring Membership.daily_call_cap
+    # "active" | "blocked". Blocking is the soft form of revocation — it needs no token management,
+    # and it is checked before the idempotency replay so a blocked user cannot be served a cached
+    # answer from before they were blocked.
+    status: str = Field(default="active")
+    note: str = Field(default="")
+    created_at: NaiveUTC = Field(default_factory=_now)
+    updated_at: NaiveUTC = Field(default_factory=_now)
+
+
+class Referral(SQLModel, table=True):
+    """One person invited another, and what we owe for it. See referrals.py and
+    docs/context/architecture/money.md.
+
+    THE ROW IS THE IDEMPOTENCY GUARD, not `ledger.grant`. `grant(once=True)` checks
+    `(org_id, kind)` with a SELECT and no backing unique index, so two concurrent redemptions
+    can both miss it — fine for a signup promo that is retried, wrong for money owed to a third
+    party. So referrals.py calls `grant(..., once=False)` and lets these two UNIQUE columns
+    arbitrate instead, the same way `CreditBlock.stripe_payment_intent` arbitrates a topup and
+    the conditional UPDATE arbitrates a reserve. Where two paths can read before either writes,
+    the database has to be the one that says no.
+
+    Status is a one-way ladder, and every terminal state is kept rather than deleted — a referral
+    we refused is the record of WHY someone was not paid, which is the first thing asked when a
+    user emails about a missing reward:
+
+        pending    attributed at signup; the friend has not topped up yet. Owes nothing.
+        qualified  the friend made their first paid top-up. Owes both bonuses, AFTER the hold.
+        paid       both grants landed. `referrer_block_id` / `referred_block_id` name them.
+        capped     qualified, but the referrer is already at their lifetime cap. Pays nothing.
+        rejected   an abuse gate said no, or the funding payment was disputed/refunded inside
+                   the hold window. `reject_reason` says which.
+    """
+
+    __table_args__ = (
+        # An org can be referred exactly once, ever. This is what stops a second signup door, a
+        # retried request, or two concurrent redemptions from paying the same bounty twice.
+        UniqueConstraint("referred_org_id", name="uq_referral_referred_org"),
+        # And one payment can fund at most one qualification, for the same reason `topup` keys on
+        # the PaymentIntent: Stripe delivers at least once and prod runs more than one instance.
+        UniqueConstraint("qualifying_payment_intent", name="uq_referral_qualifying_pi"),
+        Index("ix_referral_status_qualified", "status", "qualified_at"),
+    )
+
+    id: int | None = Field(default=None, primary_key=True)
+    code: str = Field(index=True)  # the code as typed, kept even if the referrer later changes theirs
+    referrer_user_id: int = Field(foreign_key="user.id", index=True)
+    referred_user_id: int = Field(foreign_key="user.id", index=True)
+    referred_org_id: int = Field(foreign_key="org.id")  # unique — see __table_args__
+    status: str = Field(default="pending", index=True)
+    reject_reason: str = Field(default="")
+    # The payment that qualified this referral. NULL while pending — and NULL is exempt from a
+    # unique index, so any number of pending rows coexist happily.
+    qualifying_payment_intent: str | None = Field(default=None)
+    # Stripe's stable per-card id (`pm.card.fingerprint`). NOT card data — an opaque token that only
+    # means anything inside our own Stripe account. It is the one signal that survives a fresh email
+    # address, which is exactly the abuse this program invites. Stored here and nowhere else.
+    card_fingerprint: str | None = Field(default=None, index=True)
+    # The blocks the two grants created, so a payout can be traced back into the ledger by id.
+    referrer_block_id: str | None = Field(default=None)
+    referred_block_id: str | None = Field(default=None)
+    referrer_reward_micro: int = Field(default=0)  # what was actually granted, not what was promised
+    referred_reward_micro: int = Field(default=0)
+    qualified_at: NaiveUTC | None = Field(default=None)
+    paid_at: NaiveUTC | None = Field(default=None)
+    created_at: NaiveUTC = Field(default_factory=_now, index=True)
+
+
+class Project(SQLModel, table=True):
+    """An optional sub-scope INSIDE an org — "one team roster, several projects".
+
+    The org stays the hard isolation boundary (every query is still scoped by `org_id`); a project is
+    a softer grouping on top of it. Deliberately a **label + ACL scope, not a namespace**: `Tool.name`
+    remains unique per `(org_id, name)`, so no unique constraint had to be rebuilt and two projects
+    cannot hold a same-named tool. `Tool.project_id` NULL means org-wide, which is what every tool
+    that predates projects is — so this was purely additive.
+
+    Secrets stay org-level on purpose: one shared credential legitimately backs tools in several
+    projects, so scoping it would pose a question with no good answer.
+    """
+
+    __table_args__ = (UniqueConstraint("org_id", "slug", name="uq_project_org_slug"),)
+
+    id: int | None = Field(default=None, primary_key=True)
+    org_id: int | None = Field(default=None, foreign_key="org.id", index=True)
+    name: str
+    slug: str = Field(index=True)  # the human handle inside the org
+    created_by: str = Field(default="")
+    created_at: NaiveUTC = Field(default_factory=_now)
+
+
+class OAuthClient(SQLModel, table=True):
+    """An MCP client that may ask treg for a token — ChatGPT, Claude Code, Cursor, anything.
+
+    Two ways a client arrives here and ONE row shape afterwards, which is the point: everything
+    downstream (authorize, consent, token) reads this table and never asks how the client got in.
+
+    - **dcr** — dynamic client registration (RFC 7591). The client POSTs its name and redirect URIs
+      and we mint an opaque `client_id`. This is what Claude Code and most clients do.
+    - **cimd** — a client-id metadata document. The `client_id` IS an https URL that we fetch to
+      learn the name and redirect URIs. This is what ChatGPT prefers.
+
+    Supporting only one would lock the other family out, and we would not have noticed: the client
+    we happened to test with first is the one that does not need registration.
+
+    `redirect_uris` is the security-critical column. An authorization code is delivered to a redirect
+    URI, so a client that could name an arbitrary one at authorize time could have codes posted to an
+    attacker. They are fixed here at registration and matched EXACTLY later — no prefix matching,
+    which is the classic way this check is defeated.
+    """
+
+    __table_args__ = (UniqueConstraint("client_id", name="uq_oauth_client_id"),)
+
+    id: int | None = Field(default=None, primary_key=True)
+    client_id: str
+    kind: str = Field(default="dcr")            # "dcr" | "cimd"
+    client_name: str = Field(default="")
+    client_uri: str = Field(default="")
+    logo_uri: str = Field(default="")
+    redirect_uris: list = Field(default_factory=list,
+                                sa_column=Column("redirect_uris", JSON, nullable=False))
+    scope: str = Field(default="")
+    created_at: NaiveUTC = Field(default_factory=_now)
+    # cimd only: documents change, so a cached copy has to be refreshable rather than permanent.
+    refreshed_at: NaiveUTC | None = Field(default=None)
+
+
+class OAuthCode(SQLModel, table=True):
+    """A one-time authorization code: the few seconds between a human approving and a client
+    redeeming.
+
+    Every field here exists to bind the code to the exact request that created it, because a code is
+    a bearer credential travelling through a browser redirect — through the user's history, possibly
+    a referrer header, possibly a proxy log.
+
+    - `client_id` + `redirect_uri`: a code minted for one client, deliverable to one place. Without
+      both, a code intercepted from one client could be redeemed by another.
+    - `code_challenge`: PKCE. The redeemer must prove it knows the verifier, so a code stolen in
+      transit is worthless to whoever stole it.
+    - `resource`: what the user consented to, carried into the token's `aud`. This is what stops a
+      grant for one MCP server working against another.
+    - `org_id`: WHICH TEAM. A person may belong to several, and this is the answer they chose — not
+      one the server guesses later.
+
+    Rows are deleted on redemption rather than flagged. A used code that still exists is a race
+    waiting for two redemptions to read it before either writes; deletion makes the database the
+    arbiter, the same reasoning as the conditional UPDATE in `ledger.reserve`.
+    """
+
+    __table_args__ = (UniqueConstraint("code", name="uq_oauth_code"),)
+
+    id: int | None = Field(default=None, primary_key=True)
+    code: str
+    client_id: str = Field(index=True)
+    user_id: int = Field(foreign_key="user.id", index=True)
+    org_id: int = Field(foreign_key="org.id", index=True)
+    redirect_uri: str
+    code_challenge: str = Field(default="")
+    resource: str = Field(default="")
+    scope: str = Field(default="")
+    expires_at: NaiveUTC
+    created_at: NaiveUTC = Field(default_factory=_now)
+
+
+class OAuthGrant(SQLModel, table=True):
+    """Mutable authority for one refresh-token family, separate from token provenance.
+
+    A token row records the team that token was ISSUED under and is immutable after issuance. The
+    family record records the team future tokens should spend from, which the user may change. These
+    used to be one `org_id`, so moving a grant rewrote retired rows and a later reuse-detection audit
+    blamed the destination team for a token that had actually been issued under the source team.
+
+    `granted_at` is the consent time, not a rotation time. Rotation creates token rows; it does not
+    create a new human authorization.
+    """
+
+    family_id: str = Field(primary_key=True)
+    current_org_id: int = Field(foreign_key="org.id", index=True)
+    granted_at: NaiveUTC = Field(default_factory=_now)
+
+
+class OAuthRefresh(SQLModel, table=True):
+    """A refresh token: the thing that keeps a connector working past the access token's hour.
+
+    Stored as a HASH, like every other credential treg holds. A database copy is a database leak, and
+    a refresh token is the long-lived half — the one worth stealing.
+
+    **Rotation with reuse detection**, which is the whole reason this table has a `family_id`. Each
+    refresh mints a replacement and retires the old row. If a retired token is ever presented again,
+    two things are possible and we cannot tell them apart: a client retried after a dropped response,
+    or somebody else has a copy. Treating that as ordinary would leave a thief with a working
+    credential, so the entire family is revoked and the human signs in again. An interrupted client
+    reconnects; a thief loses the token. The failure mode is inconvenience on one side and containment
+    on the other, which is the right way round.
+
+    `org_id` is immutable token provenance: the team this particular token was ISSUED under. Mutable
+    family authority lives in `OAuthGrant.current_org_id`, so moving a grant cannot rewrite history.
+    """
+
+    __table_args__ = (UniqueConstraint("token_hash", name="uq_oauth_refresh_token"),)
+
+    id: int | None = Field(default=None, primary_key=True)
+    token_hash: str
+    family_id: str = Field(index=True)      # every descendant of one grant shares this
+    client_id: str = Field(index=True)
+    user_id: int = Field(foreign_key="user.id", index=True)
+    org_id: int = Field(foreign_key="org.id", index=True)
+    resource: str = Field(default="")
+    scope: str = Field(default="")
+    expires_at: NaiveUTC
+    created_at: NaiveUTC = Field(default_factory=_now)
+    # Set when this row is superseded or killed. A row is kept rather than deleted precisely so a
+    # replay can be RECOGNISED — deleting it would make a stolen token look merely unknown.
+    retired_at: NaiveUTC | None = Field(default=None)
+    retired_reason: str = Field(default="")
+
+
+class IdempotentCall(SQLModel, table=True):
+    """One remembered answer, so a retried call is not paid for twice.
+
+    An agent retries far more than a person does. Most of those retries are already free: a 5xx, a
+    timeout or a network error is never billed. The case this table exists for is narrower and worse
+    — treg called the provider, the provider succeeded AND CHARGED US, and the response was lost on
+    the way back. The agent retries, and without this we call the provider again and bill again.
+
+    Remembering only that a key was "already billed" would not be enough: we would still make the
+    second upstream call, so we would still pay the provider and would simply be absorbing the double
+    cost instead of passing it on. The answer has to be replayed so the second request never leaves
+    treg.
+
+    **Scoped to the CALLER, never to the key alone.** Keys are chosen by clients, so the same string
+    will be picked twice. Scoped by key alone that collision serves one team's response to another,
+    which is the single failure here that leaks data instead of money.
+
+    The caller is `membership_id`, because that is what every door already resolves to: a person's
+    token, an agent token and an OAuth grant all become one `Membership` (see `Caller`). So one rule
+    covers every case — the label belongs to whoever called — and it does not matter whether that is
+    a human, an agent, or two agents inside one team.
+
+    Per caller rather than per team on purpose. Two lazily-written agents in one team will both reach
+    for `retry-1`; scoped per team they collide and the second gets a confusing refusal, scoped per
+    caller they simply never meet. Nothing is given up: this is strictly narrower than per-team, so
+    the cross-tenant leak stays closed. Stripe scopes per API key for the same reason.
+
+    `request_fingerprint` catches a client reusing one key for a DIFFERENT request. That is a caller
+    bug, and returning the old answer would hide it, so the mismatch is refused loudly instead.
+
+    `status` is `pending` while the upstream call is in flight and `done` once stored. The pending row
+    is written BEFORE the call, so two retries arriving together race on the unique constraint and the
+    loser waits for the winner instead of making a second call. Same reasoning as the conditional
+    UPDATE in `ledger.reserve`: where two paths read before either writes, the database has to be the
+    one that says no.
+    """
+
+    __table_args__ = (
+        UniqueConstraint("membership_id", "key", name="uq_idem_caller_key"),
+        # The per-call expired-label sweep in `_claim_idempotent` (Alembic 0053).
+        Index("ix_idempotentcall_membership_id_expires_at", "membership_id", "expires_at"),
+    )
+
+    id: int | None = Field(default=None, primary_key=True)
+    # org_id is kept alongside the caller so the row is still org-scoped for deletion and audit.
+    # The response cache cannot outlive its caller: once a membership is revoked nobody can replay
+    # its key, so the membership foreign key cascades instead of blocking token revocation.
+    org_id: int = Field(foreign_key="org.id", index=True)
+    membership_id: int = Field(foreign_key="membership.id", ondelete="CASCADE", index=True)
+    key: str = Field(index=True)
+    request_fingerprint: str = Field(default="")
+    endpoint_id: str = Field(default="")
+    # The X-Treg-Call-Id the FIRST call returned. A replay hands this back rather than a fresh
+    # reference, so a retry resolves to the row that actually holds the money.
+    call_ref: str = Field(default="")
+    status: str = Field(default="pending")     # "pending" | "done"
+    # Only ever set for a METERED success. A team calling on its own key is billed by the provider,
+    # not by us, and storing those responses would hold someone's data for a reason that helps nobody.
+    response_status: int | None = Field(default=None)
+    response_body: bytes | None = Field(default=None)
+    response_media_type: str = Field(default="")
+    charged_micro: int = Field(default=0)
+    created_at: NaiveUTC = Field(default_factory=_now)
+    expires_at: NaiveUTC
+
+
+class Feedback(SQLModel, table=True):
+    """A private team report, persisted before acknowledging receipt.
+
+    call_ids and endpoint_id are submitted claims. verified_call_ids contains only references
+    found in this team's audit or ledger; it verifies provenance, not the report's conclusion.
+    """
+
+    id: int | None = Field(default=None, primary_key=True)
+    org_id: int = Field(foreign_key="org.id", index=True)
+    user_email: str
+    category: str = Field(index=True)
+    message: str
+    call_ids: list[str] = Field(default_factory=list, sa_column=Column(JSON, nullable=False))
+    verified_call_ids: list[str] = Field(default_factory=list, sa_column=Column(JSON, nullable=False))
+    endpoint_id: str | None = Field(default=None)
+    # Attribution snapshot: never infer ownership from a current membership or lossy audit.
+    tags: dict | None = Field(default=None, sa_column=Column("tags", JSON, nullable=True))
+    created_at: NaiveUTC = Field(default_factory=_now)
+
+
+class HubTool(SQLModel, table=True):
+    """One version of a tool a maker published on the hub (docs/HUB-DECISIONS.md). A tool is
+    made of other tools: either a JSON list of steps or a script that runs in a sandbox. The row
+    stores the four files a maker ships (manifest, script, check, readme) plus what the runner
+    and the catalog read straight off the row.
+
+    `tool_id` is the callable id, `<team slug>.<name>`; one row per (tool_id, version). The
+    newest `live` version serves `/call/<tool_id>`; `<tool_id>@N` pins one.
+    """
+
+    __table_args__ = (UniqueConstraint("tool_id", "version", name="uq_hubtool_id_version"),)
+
+    id: int | None = Field(default=None, primary_key=True)
+    org_id: int = Field(foreign_key="org.id", index=True)
+    tool_id: str = Field(index=True)                 # `<slug>.<name>`
+    name: str
+    version: int = Field(default=1)
+    kind: str                                        # steps | script
+    status: str = Field(default="unchecked")         # unchecked | live | failed | retired
+    summary: str
+    writes: bool = Field(default=False)
+    price_micro: int = Field(default=0)              # the seller's price per successful run
+    manifest: dict = Field(default_factory=dict, sa_column=Column(JSON, nullable=False))
+    script: str | None = Field(default=None)         # run.js, script road only
+    check: dict = Field(default_factory=dict, sa_column=Column(JSON, nullable=False))
+    readme: str = Field(default="")
+    created_by: str = Field(default="")              # the maker's email
+    created_at: datetime = Field(default_factory=_now)
+    # The check run's verdict (docs/HUB-DECISIONS.md round 2 q10): {status, run_id, checked_at,
+    # error?, trace?}. Declared LAST to match the migration's ALTER TABLE append position.
+    check_result: dict | None = Field(default=None, sa_column=Column(JSON, nullable=True))
+    # The maker's uploaded CSV (docs/HUB-DECISIONS.md round 1 q6): at most 50 MB, read-only after
+    # upload, a replacement is a new version; the script reads it as ctx.data. Declared LAST
+    # (migration 0037).
+    data: str | None = Field(default=None)
+    # Phase 10 (docs/hub-listing-decisions.md): flipped without a version bump. Whether the tool is in
+    # catalog search is not a version's switch: it is the tool's HubListing row.
+    listed: bool = Field(default=False)              # UNREAD since migration 0050 (expand-only); use HubListing
+    public_log: bool = Field(default=True)           # true = the share page shows the recent-runs log
+
+
+class HubListing(SQLModel, table=True):
+    """A hub tool's place in catalog search (docs/hub-listing-decisions.md round 2, 2026-09-24): the
+    maker requests it, a superadmin approves or rejects it. One row per tool, not per version, so
+    the listing stays while each new version waits for its own review (round 4); unlisting deletes the row, and listing again
+    is a new request. Only `approved` puts the tool in search."""
+
+    tool_id: str = Field(primary_key=True)           # `<slug>.<name>`
+    org_id: int = Field(foreign_key="org.id", index=True)
+    state: str = Field(default="requested", index=True)   # requested | approved | rejected
+    reason: str = Field(default="")                  # the admin's words on a rejection, for the maker
+    requested_by: str = Field(default="")            # the maker's email
+    requested_at: datetime = Field(default_factory=_now)
+    decided_by: str = Field(default="")              # the superadmin's email
+    decided_at: datetime | None = Field(default=None)
+    # The catalog job treg approved for it (round 3): the tool then sits beside that job's providers
+    # in catalog_get. "" = in search, but beside nobody. Set only by an approval.
+    capability: str = Field(default="", index=True)
+    # An update to an approved tool waits for review (round 4): a new version (`pending_version`,
+    # its HubTool row in status `review`) and/or a new price (`pending_pricing`, {"price_usd": N}).
+    # The approved version and price keep serving until treg approves; a rejection leaves them and
+    # says why in `update_reason`.
+    pending_version: int = Field(default=0)
+    pending_pricing: dict | None = Field(default=None, sa_column=Column(JSON, nullable=True))
+    update_reason: str = Field(default="")
+    # Set by the first approval and never cleared (hub simulation run 2): an approved tool stays
+    # under review for good. Unlisting it only hides it (state `unlisted`); its new versions and
+    # prices still wait, so "approve, unlist, change" is not a way round the review.
+    reviewed: bool = Field(default=False)
+
+
+class HubRun(SQLModel, table=True):
+    """One run of a hub tool: who called, which version, what ran, what it cost. Kept 30 days.
+    Every step is ALSO an ordinary CallRecord under `{run_id}:s{n}`, so nothing here is a second
+    source of truth for money — the ledger holds the holds and settles; this row holds the trace
+    a caller and a maker read (docs/HUB-DECISIONS.md rounds 2 and 5)."""
+
+    id: int | None = Field(default=None, primary_key=True)
+    run_id: str = Field(index=True)                  # `r_<hex>`, also the parent call_ref
+    tool_id: str = Field(index=True)
+    version: int
+    caller_org_id: int = Field(foreign_key="org.id", index=True)
+    maker_org_id: int = Field(index=True)
+    caller_email: str = Field(default="")
+    status: str                                      # ok | failed | stopped
+    steps: int = Field(default=0)                    # steps counted against the caps (items included)
+    cost_micro: int = Field(default=0)               # what the steps charged the caller
+    price_micro: int = Field(default=0)              # the seller's price paid (phase 6; 0 until then)
+    duration_ms: int = Field(default=0)
+    inputs: dict = Field(default_factory=dict, sa_column=Column(JSON, nullable=False))   # secrets masked
+    trace: list = Field(default_factory=list, sa_column=Column(JSON, nullable=False))
+    log: list = Field(default_factory=list, sa_column=Column(JSON, nullable=False))
+    error: dict | None = Field(default=None, sa_column=Column(JSON, nullable=True))
+    started_at: datetime = Field(default_factory=_now, index=True)
+    finished_at: datetime | None = Field(default=None)
+    # The run's answer, for the caller's run page (docs/HUB-DECISIONS.md round 5 q8); only for
+    # successful runs, capped by the runner's 2 MB output rule. Declared LAST (migration 0029).
+    output: dict | None = Field(default=None, sa_column=Column(JSON, nullable=True))
+class FeedbackHandling(SQLModel, table=True):
+    """Internal admin state. Only treg-internal writes; absence means open/version zero."""
+
+    __table_args__ = (
+        CheckConstraint("status IN ('open', 'investigating', 'resolved', 'rejected')", name="ck_feedbackhandling_status"),
+        CheckConstraint("version >= 0", name="ck_feedbackhandling_version"),
+        Index("ix_feedbackhandling_status_feedback_id", "status", "feedback_id"),
+    )
+    feedback_id: int = Field(primary_key=True, foreign_key="feedback.id", ondelete="CASCADE")
+    status: str = Field(default="open")
+    assignee: str | None = Field(default=None)
+    version: int = Field(default=0)
+    updated_at: NaiveUTC = Field(default_factory=_now)
+
+
+class FeedbackHandlingEvent(SQLModel, table=True):
+    """Append-only internal handling history; no caller-facing API exposes these notes."""
+
+    __table_args__ = (
+        UniqueConstraint("feedback_id", "version", name="uq_feedbackhandlingevent_version"),
+        CheckConstraint("version > 0", name="ck_feedbackhandlingevent_version"),
+        CheckConstraint("from_status IN ('open', 'investigating', 'resolved', 'rejected') AND to_status IN ('open', 'investigating', 'resolved', 'rejected')", name="ck_feedbackhandlingevent_status"),
+        CheckConstraint("source IN ('web', 'api')", name="ck_feedbackhandlingevent_source"),
+        CheckConstraint("to_status NOT IN ('resolved', 'rejected') OR to_status = from_status OR length(trim(note)) > 0", name="ck_feedbackhandlingevent_closure_note"),
+    )
+    id: str = Field(primary_key=True)  # UUID generated by the internal admin server
+    feedback_id: int = Field(foreign_key="feedback.id", ondelete="CASCADE")
+    version: int
+    from_status: str
+    to_status: str
+    from_assignee: str | None = Field(default=None)
+    to_assignee: str | None = Field(default=None)
+    note: str = Field(default="")
+    links: list[str] = Field(default_factory=list, sa_column=Column(JSON, nullable=False))
+    actor: str
+    source: str
+    created_at: NaiveUTC = Field(default_factory=_now)
+
+
+class CallReview(SQLModel, table=True):
+    """One private usefulness rating per catalog call, attributed by the server."""
+
+    __table_args__ = (Index("ix_callreview_endpoint_id_created_at", "endpoint_id", "created_at"),)
+
+    id: int | None = Field(default=None, primary_key=True)
+    org_id: int = Field(foreign_key="org.id", index=True)
+    user_email: str
+    call_id: str = Field(unique=True, index=True)
+    endpoint_id: str = Field(index=True)
+    provider: str | None = Field(default=None)
+    routed_via: str | None = Field(default=None)
+    invited: bool = Field(default=False)
+    client: str = Field(default="")
+    usefulness: str
+    reason: str | None = Field(default=None)
+    created_at: NaiveUTC = Field(default_factory=_now)
+
+
+class Media(SQLModel, table=True):
+    """A reference file a member hosted for a vendor to fetch (`treg host`): the image, voice clip
+    or video an AIGC endpoint takes as a public URL. Bytes live in the row, expire by TTL, and are
+    served by an opaque token that names no org or file. See docs/context/architecture/media.md.
+    """
+
+    __table_args__ = (Index("ix_media_org_created", "org_id", "created_at"),)
+    id: int | None = Field(default=None, primary_key=True)
+    token: str = Field(unique=True, index=True)
+    org_id: int = Field(foreign_key="org.id")
+    content_type: str
+    size: int = Field(default=0)
+    body: bytes
+    created_at: NaiveUTC = Field(default_factory=_now)
+    expires_at: NaiveUTC = Field(index=True)
+
+
+class ToolRequest(SQLModel, table=True):
+    """A "the catalog doesn't have X" report — filed from the catalog page, the CLI, or by an
+    agent mid-search over MCP. Demand signal for which provider to key next; reviewed by querying
+    this table (a Slack notifier may hang off the insert later, but the row is the record).
+
+    Deliberately anonymous-friendly: an agent that just got zero results usually holds no token,
+    and a signup wall here would cost us exactly the signal we want. So identity fields are
+    nullable, the endpoint is open, and per-IP rate limiting (ratestore) is the abuse valve.
+    """
+
+    id: int | None = Field(default=None, primary_key=True)
+    # Filled when the caller was authenticated (session or token); NULL for anonymous filings.
+    org_id: int | None = Field(default=None, foreign_key="org.id", index=True)
+    user_email: str = Field(default="")
+    # What they wanted: free-text capability/provider ("Ahrefs backlinks", "weather API"), plus the
+    # search query that came up empty — auto-filled by agents, the best dedup/priority signal.
+    capability: str = Field(index=True)
+    query: str = Field(default="")
+    note: str = Field(default="")
+    contact: str = Field(default="")  # optional reach-back (email/handle); free text, unverified
+    source: str = Field(default="web", index=True)  # web | cli | mcp | claude-connector | api
+    status: str = Field(default="open", index=True)  # open | done | dismissed — flipped by hand
+    created_at: NaiveUTC = Field(default_factory=_now, index=True)
+
+
+class SearchMiss(SQLModel, table=True):
+    """A catalog search that returned NOTHING — the demand signal one step before a ToolRequest.
+
+    Most agents that miss never file a request; they just rephrase or leave. The queries themselves
+    are the record of what the catalog was asked for and couldn't answer — the raw material for
+    deciding what to ingest next and for spotting discovery failures (the capability exists but the
+    words used to ask for it don't match). Written fire-and-forget through `audit` — losing a row
+    under load costs analytics, never a search.
+
+    Deliberately identity-free: the search endpoints are open, most missing callers hold no token,
+    and the query text is the signal — who asked matters only once they file a ToolRequest.
+    """
+
+    id: int | None = Field(default=None, primary_key=True)
+    query: str  # the search text that matched nothing, capped by the writer
+    # api (HTTP /catalog/search: web + CLI) | mcp | claude-connector
+    source: str = Field(default="api", index=True)
+    created_at: NaiveUTC = Field(default_factory=_now, index=True)
+    # web-find only: why the answer was empty - gap (the catalog lacks it) | not_task | judge_off |
+    # scope (a shelf's find read that shelf only)
+    reason: str | None = Field(default=None)
+    # web-find only: the engine whose answer was served and empty (v1 | v2); a shadow files no miss
+    engine: str | None = Field(default=None)
+
+
+class SearchLog(SQLModel, table=True):
+    """One MCP catalog search under the discovery experiment (`application.search_experiment`):
+    what the lexical ranker answered, what the relevance judge answered, and what was SHOWN.
+
+    The experiment has no labels. Its signal is behaviour: a `call` by the same caller, soon after,
+    to an endpoint that was on the page. That join needs the page as it was served and, for an
+    interleaved page, which ranker put each row there — so the row keeps both full lists and the
+    per-row owner rather than a summary. `baseline_total` (0 = the lexical gate admitted nothing)
+    is the stratum: recall gain and ranking gain are different claims and are read separately.
+
+    Carries identity, unlike `SearchMiss`, because the caller's later call is the outcome — an
+    anonymous row has no outcome to join. Written fire-and-forget through `audit.record_search`;
+    a dropped row costs one sample, never a search. The judge's timings and errors ride along so
+    the latency guardrail reads from the same table as the effect.
+    """
+
+    id: int | None = Field(default=None, primary_key=True)
+    created_at: datetime = Field(default_factory=_now, index=True)
+    source: str = Field(default="mcp", index=True)          # mcp | claude-connector
+    query: str                                               # capped by the writer
+    org_id: int | None = Field(default=None, index=True)
+    user_email: str | None = Field(default=None)
+    mode: str                                                # shadow | interleave
+    arm: str                                                 # shadow | baseline | judged | interleave
+    # [endpoint_id, ...] — the lexical page as the caller would have seen it without the experiment
+    baseline_ids: list | None = Field(default=None, sa_column=Column("baseline_ids", JSON, nullable=True))
+    # [[endpoint_id, probability], ...] — the judge's kept rows, in the order the judged arm shows
+    judged: list | None = Field(default=None, sa_column=Column("judged", JSON, nullable=True))
+    # [[endpoint_id, owner, job], ...] — the page actually served; owner is baseline | judged | both
+    # (| name | hub), job the row's capability so a later call to any vendor of it can be credited
+    shown: list | None = Field(default=None, sa_column=Column("shown", JSON, nullable=True))
+    baseline_total: int = 0                                  # lexical matches before the page cut
+    differs: bool = False                                    # the two pages are not the same set+order
+    judge_ms: int | None = Field(default=None)
+    judge_tokens_in: int | None = Field(default=None)
+    judge_tokens_out: int | None = Field(default=None)
+    judge_error: str | None = Field(default=None)            # timeout | http_<status> | <exception>; None = answered
+    # web-find only (application.catalog_find): which engine answered (v1 | v2; shadow writes one
+    # row for each), and v2's own readings - the judge's platform pick and name probability, the
+    # recall's time, and every unit it read as [kind, id, probability]
+    engine: str | None = Field(default=None)
+    platform_choice: str | None = Field(default=None)
+    platform_conf: float | None = Field(default=None)
+    name_p: float | None = Field(default=None)
+    recall_ms: int | None = Field(default=None)
+    embed_ms: int | None = Field(default=None)
+    embed_error: str | None = Field(default=None)
+    units: list | None = Field(default=None, sa_column=Column("units", JSON, nullable=True))
+    # the verdict a v2 answer ended on, the reason after a colon where there is one
+    # (strong | closest | name | none:gap | keyword | keyword:not_task ...); None for v1
+    verdict: str | None = Field(default=None)
+
+
+class CapacityPolicy(SQLModel, table=True):
+    """How one treg-owned provider account (tier 4) is funded and metered — written by the capacity
+    worker only (`treg-worker capacity sweep`), never by the call path.
+
+    One row per platform-key slot plus one per overflow aggregator (`overflow:orthogonal`, …): the
+    aggregators are prepaid accounts that run dry exactly like a vendor's. `capacity_type` says what
+    the provider meters (cash, credits, requests, a resetting quota, a flat subscription) and
+    `source` how we learn it (its free account API, response headers, a calculation, a hand entry,
+    nothing). `unknown`/`none` are honest defaults for a provider nobody has classified yet — a
+    sweep flags them rather than inventing a number. Numbers only: no key or payment detail lives
+    here. See docs/PROVIDER-CAPACITY-PLAN.md §2.2.
+    """
+
+    provider: str = Field(primary_key=True)
+    capacity_type: str = Field(default="unknown")  # cash | credits | requests | monthly_quota | rolling_quota | subscription | unknown
+    source: str = Field(default="none")             # api | headers | calculated | manual | none
+    funding_mode: str = Field(default="unknown")    # auto_recharge | auto_upgrade | manual | quota_reset | unknown
+    auto_funding_enabled: bool = Field(default=False)
+    auto_funding_verified_at: NaiveUTC | None = Field(default=None)
+    auto_trigger_below: float | None = Field(default=None)  # in the provider's own unit
+    auto_amount: float | None = Field(default=None)
+    auto_ceiling: float | None = Field(default=None)
+    target_runway_days: int = Field(default=30)
+    warn_days: int = Field(default=14)
+    urgent_days: int = Field(default=7)
+    critical_days: int = Field(default=3)
+    # micro-USD per provider unit, NULL = unknown (never invent a dollar figure from it)
+    usd_per_unit_micro: int | None = Field(default=None)
+    owner_email: str = Field(default="")
+    dashboard_url: str = Field(default="")
+    runbook: str = Field(default="")
+    overflow_allowed: bool = Field(default=True)
+    # {"limit": int, "window_s": int, "source": "headers|docs|observed"} — the burst limit
+    rate_limit: dict | None = Field(default=None, sa_column=Column("rate_limit", JSON, nullable=True))
+    # {"limit": int, "period": "day|month|billing", "resets_at_rule": str} — the period allowance
+    quota: dict | None = Field(default=None, sa_column=Column("quota", JSON, nullable=True))
+    enabled: bool = Field(default=True)  # a slot with no key in the env is imported disabled
+    created_at: NaiveUTC = Field(default_factory=_now)
+    updated_at: NaiveUTC = Field(default_factory=_now)
+
+
+class CapacitySnapshot(SQLModel, table=True):
+    """One observation of what a provider says treg's account has left. Appended by every sweep
+    (and later by header capture); never updated. `remaining`/`total` are in the provider's own
+    `unit` — only DataForSEO and TikHub speak dollars. A failed collector is still a row, with
+    `error` set and `confidence='stale'`, so an outage is visible as a gap in the curve rather than
+    as silence. Contains numbers and a short note only — never a credential or payment detail.
+    """
+
+    id: int | None = Field(default=None, primary_key=True)
+    provider: str = Field(index=True)
+    observed_at: NaiveUTC = Field(default_factory=_now, index=True)
+    remaining: float | None = Field(default=None)
+    total: float | None = Field(default=None)
+    unit: str = Field(default="")
+    resets_at: NaiveUTC | None = Field(default=None)
+    source: str = Field(default="api")           # api | headers | calculated | manual
+    confidence: str = Field(default="exact")     # exact | estimate | stale
+    note: str = Field(default="")
+    error: str = Field(default="")
+
+
+class OverflowRoute(SQLModel, table=True):
+    """One `(endpoint_id, aggregator)` pair: the same vendor endpoint served through a treg-owned
+    aggregator account (tier 4b, `platform-overflow`) when our direct account is out.
+
+    Filled by the worker's `treg-worker overflow sync` — never by hand, never by the call path.
+    `enabled` is DERIVED by `domain.capacity.routes.eligible` at sync time (same unit, ratio ≤ 4,
+    platform-eligible, policy allows, verified < 7 days ago); the call path only ever reads it.
+    Prices are the aggregator's list price in micro-USD: the caller pays exactly that, 0% markup,
+    disclosed in-band. See docs/PROVIDER-CAPACITY-PLAN.md §4.3.
+    """
+
+    endpoint_id: str = Field(primary_key=True)
+    aggregator: str = Field(primary_key=True)   # orthogonal | monid
+    provider: str = Field(index=True)
+    method: str
+    path: str
+    agg_slug: str            # the aggregator's name for the vendor (api slug / provider id)
+    agg_path: str            # the aggregator's spelling of the vendor path
+    agg_price_micro: int | None = Field(default=None)
+    agg_unit: str = Field(default="call")       # call | result
+    ratio: float | None = Field(default=None)   # agg price / our per-event price
+    single_result: bool | None = Field(default=None)  # a per-result aggregator route that returns ≤ 1 record
+    enabled: bool = Field(default=False, index=True)
+    disabled_reason: str = Field(default="")
+    matched_at: NaiveUTC | None = Field(default=None)
+    last_verified_at: NaiveUTC | None = Field(default=None)
+    updated_at: NaiveUTC = Field(default_factory=_now)
+
+
+class OverflowSpend(SQLModel, table=True):
+    """Per-aggregator, per-UTC-day overflow accounting: what the aggregator charged treg
+    (`cost_micro`) and the delta against what the caller would have paid direct (`delta_micro`,
+    may be negative). Written INSIDE the child's settle transaction (allowlist entry
+    `overflow_spend_in_settle`) and, in shadow mode, by the shadow probe — never anywhere else. The
+    $20/day/aggregator budget (`Settings.overflow_daily_budget_usd`) is checked against it before a
+    child hold is placed. Not money: balances move only through domain/money.
+    """
+
+    aggregator: str = Field(primary_key=True)
+    day: str = Field(primary_key=True)  # YYYY-MM-DD, UTC
+    calls: int = Field(default=0)
+    cost_micro: int = Field(default=0)
+    delta_micro: int = Field(default=0)
+    updated_at: NaiveUTC = Field(default_factory=_now)
+
+
+class ArchiveKey(SQLModel, table=True):
+    """One logical question the platform has answered at least once — the archive's index row.
+
+    The key hash comes from `archive.cache_key`: method + endpoint + canonical URL/query/body,
+    credentials and transport noise excluded. One row carries everything the timer learner and the
+    refresh worker need about this question: when it was last fetched, how it has changed across
+    refetches, how often callers ask (heat), and which JSON paths turned out to be noise.
+
+    **Scoped by the key itself.** Every catalog answer the policy allows is recorded, whichever
+    credential made the call, but WHOSE question it is (`archive.sharing`) is folded into the
+    key hash: a platform-key answer is public and one team's fetch may warm another team's hit;
+    an own-credential answer lives under an org-scoped key (or a connection-scoped one on an
+    `own_account` endpoint) that nobody else ever computes, and reaches the public key only where
+    the endpoint declares `cache.sharing: public`. `scope` names that kind of key ("org", "conn",
+    NULL = public, including every key from before the column) so the refresh worker skips the
+    private ones. `ArchiveKeyOrg` remembers which teams have paid for which question so a repeat
+    hit can be priced.
+
+    Timer state is AIMD (grow slowly on stability, shrink fast on change): `ttl_s` is the current
+    per-key timer, adjusted by the learner on every refetch outcome. `change_seen` / `stable_seen`
+    count eligible observations. Only found-to-found comparisons can count stable; explicit
+    appearance/disappearance counts changed. Comparisons use raw hashes without changing stored
+    bytes. `volatile_paths` is a retired column retained for schema compatibility.
+    """
+
+    __table_args__ = (UniqueConstraint("key_hash", name="uq_archive_key_hash"),)
+
+    id: int | None = Field(default=None, primary_key=True)
+    key_hash: str                                 # sha256 from archive.cache_key
+    endpoint_id: str = Field(index=True)           # catalog endpoint id — policy + report joins
+    provider: str = Field(default="", index=True)  # denormalized for per-provider budgets/reports
+    policy: str = Field(default="forbidden")       # effective policy when last written (see archive)
+    # --- timer (AIMD) ---
+    ttl_s: int = Field(default=0)                  # current per-key timer; 0 = no serving opinion yet
+    fetched_at: NaiveUTC = Field(default_factory=_now, index=True)  # newest snapshot's fetch time
+    # --- change statistics (the learner's evidence) ---
+    change_seen: int = Field(default=0)            # eligible observations classified changed
+    stable_seen: int = Field(default=0)            # positive observations classified stable
+    last_changed_at: NaiveUTC | None = Field(default=None)
+    volatile_paths: list = Field(default_factory=list, sa_column=Column(JSON))
+    # --- demand (what earns a refresh) ---
+    heat: float = Field(default=0.0)               # decayed request rate, updated on each hit/miss
+    last_requested_at: NaiveUTC | None = Field(default=None)
+    created_at: NaiveUTC = Field(default_factory=_now)
+    # The pre-injection request shape, stored so the refresh worker can re-ask the exact question.
+    # Credentials cannot appear here: injection happens inside the relay, after this shape is
+    # fixed. Declared LAST to match the migration's ALTER TABLE append position.
+    req_method: str = Field(default="")
+    req_url: str = Field(default="")
+    req_body: bytes | None = Field(default=None)
+    # Only the headers that KEY (Accept / Accept-Language, when the caller sent them): the worker
+    # must replay them or its recording lands under a different key than the caller's question.
+    req_headers: dict = Field(default_factory=dict, sa_column=Column(JSON))
+
+    # Null state marks legacy keys, classified lazily. The pointer belongs to this key and
+    # names the last found/empty observation; errors cannot replace decisive evidence.
+    # No cyclic FK: archive owns both writes, validates key_id, and never deletes snapshots.
+    result_state: str | None = Field(default=None)
+    result_snapshot_id: int | None = Field(default=None)
+    # Detect writes from an older binary that did not maintain the result decision.
+    result_observed_version: int | None = Field(default=None)
+    # "org" | "conn" for a private key (see archive.scope_tags); NULL = public. Declared LAST
+    # (migration 0039).
+    scope: str | None = Field(default=None)
+
+
+class ArchiveSnapshot(SQLModel, table=True):
+    """One historical answer. Cache eligibility is tracked separately on ArchiveKey.
+
+    Bytes are kept VERBATIM: strict comparison uses raw hashes; legacy noise detection only
+    operates on a comparison copy. A hit replays exactly what the vendor sent (relay faithfulness,
+    extended through time). `content_hash` (sha256 of the raw body) deduplicates: consecutive
+    identical answers add a version row but reference the same bytes via `body_of` instead of
+    storing them again — the history of "asked on these dates, same answer" is itself data.
+
+    Bodies live in Postgres, the IdempotentCall precedent (a paid answer worth keeping is already
+    stored there today); `body` is NULL when `body_of` points at the row that carries the bytes.
+    Oversized bodies are skipped by the recorder, not truncated — a half answer is worse than none.
+
+    Old versions of a `transient`-policy key are prunable; an `archive`-policy key keeps its
+    history — that difference is enforced by the (future) worker's pruning pass, not by schema.
+    """
+
+    __table_args__ = (
+        UniqueConstraint("key_id", "version", name="uq_archive_snapshot_version"),
+        Index("ix_archive_snapshot_content", "content_hash"),
+        # Partial index for the report's "refreshes today" count — only refresh-origin rows.
+        Index("ix_archivesnapshot_refresh_fetched", "fetched_at",
+              postgresql_where=text("origin = 'refresh'"), sqlite_where=text("origin = 'refresh'")),
+    )
+
+    id: int | None = Field(default=None, primary_key=True)
+    key_id: int = Field(foreign_key="archivekey.id", index=True)
+    version: int = Field(default=1)                # 1..N within the key, newest = max
+    status_code: int = Field(default=200)
+    media_type: str = Field(default="")
+    content_hash: str                              # sha256 of the RAW body (dedup identity)
+    body: bytes | None = Field(default=None)       # verbatim bytes, or NULL when body_of is set
+    body_of: int | None = Field(default=None, foreign_key="archivesnapshot.id")
+    size_bytes: int = Field(default=0)             # of the raw body, even when deduplicated
+    fetched_at: NaiveUTC = Field(default_factory=_now, index=True)
+    # Who triggered the fetch: "caller" (a real request) | "refresh" (worker) | "sample" (learner).
+    origin: str = Field(default="caller")
+    # How `body` is stored on disk: NULL = raw bytes (all rows before 0014), "zlib" = compressed.
+    # Readers unpack; size_bytes and content_hash always describe the RAW bytes. Declared LAST to
+    # match the migration's ALTER TABLE append position.
+    enc: str | None = Field(default=None)
+
+
+    # NULL is a legacy DB row. R2 objects are addressed directly by content_hash.
+    body_storage: str | None = Field(default=None)
+    # The team whose OWN credential fetched this answer; NULL when treg's platform key did.
+    # Provenance for the admin views - what confines the answer is the KEY's scope, not this
+    # column. Declared LAST (migration 0039).
+    origin_org_id: int | None = Field(default=None)
+
+
+class ArchiveKeyOrg(SQLModel, table=True):
+    """Which teams have paid for which archived question - the repeat-hit pricing ledger's index.
+
+    One row per (org, key): written inside the metered settle transaction the first time a team's
+    call on that question is billed, live or hit, and bumped on every later billed call. A hit
+    whose row already exists is a REPEAT for that team and settles at
+    `archive_hit_repeat_price_percent` of the live price (`archive.md`, "Pricing a hit"). Keyed by
+    `key_hash` rather than `ArchiveKey.id` because the hash is known on the call path before the
+    background recorder has created the key row. Written only by `archive`.
+    """
+
+    __table_args__ = (UniqueConstraint("org_id", "key_hash", name="uq_archive_key_org"),)
+
+    id: int | None = Field(default=None, primary_key=True)
+    org_id: int = Field(index=True)
+    key_hash: str = Field(index=True)
+    first_call_at: NaiveUTC = Field(default_factory=_now)
+    last_call_at: NaiveUTC = Field(default_factory=_now)
+    calls: int = Field(default=1)
+
+
+class ArenaRun(SQLModel, table=True):
+    """Private, bounded Arena run. Encrypted payload owns the frozen plan and result snapshots."""
+    __table_args__ = (UniqueConstraint("org_id", "user_id", "request_key", name="uq_arena_request"),)
+    id: str = Field(primary_key=True)
+    org_id: int = Field(foreign_key="org.id", index=True)
+    user_id: int = Field(index=True)  # provenance; survives membership removal without granting access
+    request_key: str
+    fingerprint: str
+    capability: str
+    mode: str
+    state: str = "running"
+    payload: str
+    created_at: NaiveUTC = Field(default_factory=_now)
+    deadline_at: NaiveUTC
+    expires_at: NaiveUTC = Field(index=True)
+    cancel_requested: bool = False
+    revealed_at: NaiveUTC | None = None
+
+
+class WebArenaRun(SQLModel, table=True):
+    """Private Web Arena quote, attempts, and result checks in one encrypted payload."""
+    id: str = Field(primary_key=True)
+    org_id: int = Field(foreign_key="org.id", index=True)
+    user_id: int = Field(index=True)
+    task: str
+    mode: str
+    state: str
+    payload: str
+    created_at: NaiveUTC = Field(default_factory=_now, index=True)
+    deadline_at: NaiveUTC
+    expires_at: NaiveUTC = Field(index=True)
+    cancel_requested: bool = False
+
+
+class WebArenaPublication(SQLModel, table=True):
+    """Content-free live totals, read without running providers."""
+    id: str = Field(primary_key=True)
+    kind: str = Field(index=True)
+    version: str
+    payload: dict = Field(sa_type=JSON)
+    created_at: NaiveUTC = Field(default_factory=_now)
+
+
+class WebArenaJudgeBudget(SQLModel, table=True):
+    """Daily Jev admission counter; one global row and one row per user."""
+    id: str = Field(primary_key=True)
+    calls: int = 0
+
+
+class WebArenaCallDayStat(SQLModel, table=True):
+    """Content-free, uncached provider-call observations for one endpoint and UTC day."""
+    __table_args__ = (UniqueConstraint("endpoint_id", "day", name="uq_webarenacalldaystat_endpoint_day"),)
+    id: int | None = Field(default=None, primary_key=True)
+    endpoint_id: str = Field(index=True)
+    day: str = Field(index=True)
+    calls: int = 0
+    decided: int = 0
+    hits: int = 0
+    timed: int = 0
+    duration_sum_ms: int = 0
+    duration_sample: list[int] = Field(default_factory=list, sa_type=JSON)
+
+
+class WebArenaCallCursor(SQLModel, table=True):
+    """Last audited call folded into Web Arena's traffic observations."""
+    id: str = Field(primary_key=True)
+    call_id: int = 0
+    updated_at: NaiveUTC = Field(default_factory=_now)
+    observed_since: NaiveUTC | None = None  # start of the one-time shortened observation seed
+
+
+class WebArenaSeedProgress(SQLModel, table=True):
+    """Saved position in the initial Web observation seed."""
+    id: str = Field(primary_key=True)
+    observed_since: NaiveUTC
+    lagged_until: NaiveUTC
+    first_id: int
+    highwater_id: int
+    endpoints: list[str] = Field(sa_type=JSON)
+    last_id: int
+    endpoint_index: int = 0
+    scanned: int = 0
+    eligible_calls: int = 0
+    updated_at: NaiveUTC = Field(default_factory=_now)
+
+
+class WebArenaSeedDayStat(SQLModel, table=True):
+    """Content-free daily buckets kept separate until the seed is complete."""
+    __table_args__ = (UniqueConstraint("endpoint_id", "day", name="uq_webarenaseeddaystat_endpoint_day"),)
+    id: int | None = Field(default=None, primary_key=True)
+    endpoint_id: str = Field(index=True)
+    day: str = Field(index=True)
+    calls: int = 0
+    decided: int = 0
+    hits: int = 0
+    timed: int = 0
+    duration_sum_ms: int = 0
+    duration_sample: list[int] = Field(default_factory=list, sa_type=JSON)
+
+
+class ArenaEvaluation(SQLModel, table=True):
+    """One immutable preference for a run's creator, including its exposure context."""
+    __table_args__ = (UniqueConstraint("run_id", name="uq_arena_evaluation"),)
+    id: str = Field(primary_key=True)
+    org_id: int = Field(foreign_key="org.id", index=True)
+    run_id: str = Field(foreign_key="arenarun.id")
+    user_id: int
+    kind: str
+    payload: str  # encrypted selection, exposure snapshot, reasons and optional comment
+    created_at: NaiveUTC = Field(default_factory=_now)
+
+
+class ArchiveEndpointStat(SQLModel, table=True):
+    """The archive report's running totals, one row per endpoint — maintained by the recorder in
+    the SAME transaction as each snapshot, so the panel reads 50 tiny rows instead of walking
+    434k keys + 505k snapshots (measured 9.9s + 8.0s + 14.8s per report on prod, 2026-09-03).
+    Counters move only via atomic column arithmetic (col = col + n): the credit-block drift
+    taught us what read-modify-write does under parallel settles."""
+
+    endpoint_id: str = Field(primary_key=True)
+    provider: str = Field(default="")
+    policy: str = Field(default="forbidden")       # the policy last observed for this endpoint
+    keys: int = Field(default=0)                   # distinct questions ever seen
+    stable: int = Field(default=0)                 # refetches whose stripped answer matched
+    changed: int = Field(default=0)                # refetches whose stripped answer differed
+    snapshots: int = Field(default=0)              # versions stored (bodies + dedup references)
+    bodies_kept: int = Field(default=0)            # versions whose bytes were kept
+    kept_bytes: int = Field(default=0, sa_column=Column(BigInteger, nullable=False, server_default="0"))  # already past int32 on prod
+    newest_fetch: NaiveUTC | None = Field(default=None)
+
+
+class ArenaObservation(SQLModel, table=True):
+    """Derived, non-content call evidence; written only by application.arena_insights."""
+    __table_args__ = (Index("ix_arenaobservation_window", "version", "created_at"),
+                      Index("ix_arenaobservation_request", "version", "endpoint", "input", "request_hash", "created_at"),)
+    id: int = Field(primary_key=True)  # audit ID, deliberately no FK into lossy audit retention
+    version: str
+    endpoint: str
+    task: str
+    input: str
+    request_hash: str
+    category: str
+    duration_ms: int | None = None
+    created_at: NaiveUTC
+
+
+class ArenaInsightState(SQLModel, table=True):
+    """Persistent collection cursor and public aggregate, never raw request/response content."""
+    id: str = Field(primary_key=True)
+    cursor: int = 0
+    scan_until: NaiveUTC
+    updated_at: NaiveUTC | None = None
+    payload: dict = Field(default_factory=dict, sa_column=Column(JSON, nullable=False))
+
+
+class ArenaVerificationSnapshot(SQLModel, table=True):
+    """Published aggregate only; private contact evidence never enters this table."""
+    id: str = Field(primary_key=True)
+    source_digest: str
+    published_at: NaiveUTC = Field(index=True)
+    payload: dict = Field(default_factory=dict, sa_column=Column(JSON))
+
+
+class EndpointDayStat(SQLModel, table=True):
+    """One catalog endpoint's observed reliability for one UTC day — the read model behind
+    `domain/catalog/stats`. Folded from `callrecord` by `application.catalog_stats.refresh` (the
+    `treg-worker catalog stats` cron), which is this table's only writer; the catalog reads thirty
+    of these rows per endpoint instead of aggregating a month of audit rows on every refresh,
+    which competed with the money path for the database's cache.
+
+    Every column is a count, a timestamp or a bounded sample of durations: nothing here can
+    identify a caller, and the floors in `stats.publish` still apply when the rows are read back.
+    """
+
+    __table_args__ = (Index("ix_endpointdaystat_day", "day"),)  # the window prune
+
+    endpoint_id: str = Field(primary_key=True)
+    day: str = Field(primary_key=True)  # YYYY-MM-DD, UTC, from CallRecord.created_at
+    n: int = Field(default=0)              # rows the provider actually saw (refused_by IS NULL)
+    ok: int = Field(default=0)             # 2xx
+    bad: int = Field(default=0)            # 5xx, plus 405 (a stale catalog contract, see stats)
+    last_ok_at: NaiveUTC | None = Field(default=None)
+    hits: int = Field(default=0)
+    hit_decided: int = Field(default=0)
+    paid_hits: int = Field(default=0)      # per_success fallback rows, see stats.observed
+    free_misses: int = Field(default=0)
+    latency_seen: int = Field(default=0)   # successful rows with a duration, for the reservoir
+    latency_sample: list = Field(default_factory=list, sa_column=Column(JSON, nullable=False))
+    updated_at: NaiveUTC = Field(default_factory=_now)
+    # Calls per contract verdict word (`CallRecord.verdict`), `{"valid": 31, "catch_all": 4}`.
+    # NULL on a bucket folded before the column existed; read as empty.
+    verdicts: dict | None = Field(default=None, sa_column=Column(JSON, nullable=True))
+
+
+class EndpointStatCursor(SQLModel, table=True):
+    """Where `application.catalog_stats.refresh` has got to in `callrecord`, and whether it has
+    caught up. One row (`id = "callrecord"`). `caught_up_at` is NULL until a run drains the backlog,
+    and the catalog keeps computing observations live until then, so a fresh install or a
+    deployment that has not scheduled the worker yet behaves exactly as before.
+    """
+
+    id: str = Field(primary_key=True)
+    cursor_id: int = Field(default=0)             # last consumed CallRecord.id
+    watermark: NaiveUTC | None = Field(default=None)  # created_at of the last consumed row
+    caught_up_at: NaiveUTC | None = Field(default=None)
+    updated_at: NaiveUTC = Field(default_factory=_now)
+
+
+class OnboardingProfile(SQLModel, table=True):
+    """One new user's first-run lookup: what was found about them, the ranked first tasks and their
+    filled-in inputs. One row per user, ever; `application.onboarding` is its only writer. The
+    payload is encrypted: it holds the email's GitHub profile, company and homepage evidence."""
+    id: int | None = Field(default=None, primary_key=True)
+    user_id: int = Field(index=True, unique=True)   # provenance; no FK, like ArenaRun
+    org_id: int | None = Field(default=None, index=True)
+    status: str = "pending"        # pending (hints only) | running | done | failed
+    payload: str = ""
+    house_cost_micro: int = Field(default=0, sa_column=Column(BigInteger, nullable=False, server_default="0"))
+    created_at: NaiveUTC = Field(default_factory=_now)
+    finished_at: NaiveUTC | None = None

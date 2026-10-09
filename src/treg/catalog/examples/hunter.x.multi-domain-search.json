@@ -1,0 +1,34 @@
+{
+  "data": [
+    {
+      "reveal_handle": "Qk1hQ2c9PS0tZW5jcnlwdGVkLW9wYXF1ZS1oYW5kbGU",
+      "name": "John D.",
+      "position": "Chief Technology Officer",
+      "department": "executive",
+      "seniority": "executive",
+      "type": "personal",
+      "decision_maker": true,
+      "domain": "stripe.com",
+      "company_name": "stripe",
+      "full_name_exists": true,
+      "phone_number_exists": false,
+      "linkedin_exists": true,
+      "verification": {
+        "date": null,
+        "status": "valid"
+      }
+    }
+  ],
+  "meta": {
+    "results": 4821,
+    "next_search_after": "IjRhZi1lbmNyeXB0ZWQtb3BhcXVlLWN1cnNvci10b2tlbiI",
+    "params": {
+      "location": [
+        "US"
+      ],
+      "department": [
+        "executive"
+      ]
+    }
+  }
+}

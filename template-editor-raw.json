@@ -1,0 +1,41 @@
+{
+  "variables": [
+    {
+      "key": "TREG_PUBLIC_URL",
+      "description": "Public base URL users reach. Railway injects the deployment's domain.",
+      "label": "Public URL",
+      "value": "",
+      "advanced": false
+    },
+    {
+      "key": "TREG_GITHUB_CLIENT_ID",
+      "description": "OAuth App Client ID for GitHub sign-in (recommended).",
+      "label": "GitHub OAuth Client ID",
+      "value": "",
+      "advanced": false
+    },
+    {
+      "key": "TREG_GITHUB_CLIENT_SECRET",
+      "description": "OAuth App Secret for GitHub sign-in.",
+      "label": "GitHub OAuth Client Secret",
+      "value": "",
+      "type": "secret",
+      "advanced": false
+    },
+    {
+      "key": "TREG_RESEND_API_KEY",
+      "description": "Resend API key (optional, for email OTP login).",
+      "label": "Resend API key",
+      "value": "",
+      "type": "secret",
+      "advanced": true
+    },
+    {
+      "key": "TREG_EMAIL_FROM",
+      "description": "Email From header (defaults to tools-registry <no-reply@treg.to>).",
+      "label": "Email From",
+      "value": "",
+      "advanced": true
+    }
+  ]
+}

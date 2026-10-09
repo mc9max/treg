@@ -1,0 +1,107 @@
+.venv/
+__pycache__/
+*.pyc
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+*.sqlite*-wal
+*.sqlite*-shm
+*.bak
+.env
+.env.*
+.secret/
+.secrets/
+.pytest_cache/
+dist/
+/.playwright-cli
+scripts/.dev-home/
+.claude/
+.superdesign/
+/videos
+docs/proposals/
+# Launch/marketing drafts and UI scratch. Useful locally, not part of the product, and a draft
+# published by accident reads as a claim we made on purpose.
+docs/hn-launch-post.md
+/prototypes/
+
+# Video-production skills. They belong to how we make launch material, not to treg, and they carry
+# ~3.6MB of third-party font and brand assets — including CD Projekt Red fan-kit files whose own
+# terms forbid commercial use. Nothing here should ship in a public repo for a commercial service.
+.agents/skills/embedded-captions/
+.agents/skills/faceless-explainer/
+.agents/skills/general-video/
+.agents/skills/hyperframes*/
+.agents/skills/media-use/
+.agents/skills/motion-graphics/
+.agents/skills/music-to-video/
+.agents/skills/pr-to-video/
+.agents/skills/product-launch-video/
+.agents/skills/remotion-to-hyperframes/
+.agents/skills/slideshow/
+.agents/skills/talking-head-recut/
+.agents/skills/video-craft/
+.agents/skills/figma/
+# Machine-local symlinks into .agents/skills — they resolve only on the machine that made them.
+/.claude/
+skills-lock.json
+
+# Local planning / handoffs — private, never committed.
+.context/
+# Agent-skill specs and plans default to docs/superpowers/; they are working notes, not the design
+# record, and belong in .context/ like any other plan.
+docs/superpowers/
+
+# Working docs that are plans/audits, not the shipped design record — they go stale the day
+# after they are written and read as commitments they are not.
+docs/PLATFORM-BALANCE-PLAN.md
+docs/context/interface/*-plan.md
+docs/context/interface/*-audit-*.md
+docs/assets/restyle-*.png
+docs/context/interface/*-proposal.md
+.codegraph/
+
+# e2e harness scratch (see e2e-server.sh) — the DB is disposable, never commit it.
+e2e.db*
+
+# Generated usage dashboards — regenerate with scripts/usage_report.py, never commit.
+/reports/
+
+# Review scratch: a prompt handed to an external reviewer, and its runner. Useful while a branch is
+# in review, meaningless after it merges.
+/.codex-review-prompt.md
+/.codex-review.sh
+
+# Scratch file used to compose commit messages (heredocs are blocked in this harness).
+/.git-commit-msg
+
+# Loopany loop specs and run records live on the machines that run the loops,
+# not in the product repo (Jason, 2026-08-25).
+/loopany/
+.DS_Store
+
+# Never in git, never in the sdist (see [tool.hatch.build.targets.sdist])
+docs/evidence/
+.import_linter_cache/
+body.json
+
+# Test screenshots — regenerated on demand, not versioned.
+tests/screenshots/
+
+# ArcTerm session boards and carry files (private, per machine)
+.arcterm/
+# Arena production statistics belong in the database, never a bundled snapshot.
+/src/treg/web/enrich-arena/insights.json
+
+# ArcTerm writes this local backup beside CLAUDE.md; it is not project content.
+CLAUDE.md.arcterm-bak
+# Frontend dependencies, build output and browser test artifacts.
+node_modules
+/src/treg/web/dashboard/
+/frontend/test-results/
+/frontend/playwright-report/
+
+# Global Vue runtime copied from the npm lockfile during the frontend build.
+/src/treg/web/vendor/*.js
+/src/treg/web/vendor/LICENSE

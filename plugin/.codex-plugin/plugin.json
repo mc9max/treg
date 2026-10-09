@@ -1,0 +1,48 @@
+{
+  "name": "treg",
+  "version": "0.25.0",
+  "description": "People, company, AEO, ads and social data for your agent.",
+  "author": {
+    "name": "superdesign",
+    "email": "no-reply@treg.to",
+    "url": "https://treg.to"
+  },
+  "homepage": "https://treg.to",
+  "repository": "https://github.com/superdesigndev/treg",
+  "license": "Apache-2.0",
+  "keywords": [
+    "api",
+    "tools",
+    "seo",
+    "serp",
+    "backlinks",
+    "enrichment",
+    "web-data",
+    "oauth"
+  ],
+  "skills": "./skills/",
+  "mcpServers": "./.mcp.json",
+  "interface": {
+    "displayName": "Treg",
+    "shortDescription": "Live data for AI agents",
+    "longDescription": "People and company enrichment, AEO and SEO, ads and social data, plus UGC video and images - all in one place, with no provider API keys to manage.",
+    "developerName": "superdesign",
+    "category": "Developer Tools",
+    "capabilities": [
+      "Interactive",
+      "Write"
+    ],
+    "websiteURL": "https://treg.to",
+    "supportURL": "https://treg.to/support",
+    "privacyPolicyURL": "https://treg.to/privacy",
+    "termsOfServiceURL": "https://treg.to/terms",
+    "defaultPrompt": [
+      "Find the work email for a person at a company using treg.",
+      "Use treg to get the backlink profile for a domain.",
+      "Search treg's catalog for a way to get keyword search volume and compare the options."
+    ],
+    "brandColor": "#e0703f",
+    "composerIcon": "./assets/icon.svg",
+    "logo": "./assets/logo.png"
+  }
+}

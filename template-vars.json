@@ -1,0 +1,55 @@
+{
+  "$schema": "https://railway.app/template-vars.schema.json",
+  "variables": [
+    {
+      "key": "TREG_PUBLIC_URL",
+      "description": "Public URL users reach. Used for OAuth redirect URIs, email links, and the dashboard. MUST be set to this deployment's Railway domain — otherwise GitHub OAuth and email links break. Railway fills this for you via the system variable, shown below.",
+      "value": "",
+      "label": "<b>Public URL</b> — auto-filled by Railway below",
+      "type": "string",
+      "required": false,
+      "advanced": false,
+      "helpText": "Leave blank — the system variable on the next row injects the deployment's public domain automatically. Only override if you put a custom domain / CNAME in front."
+    },
+    {
+      "key": "TREG_PUBLIC_URL",
+      "description": "system.domain",
+      "value": "{{system.domain}}",
+      "label": "system.domain",
+      "type": "system",
+      "advanced": true
+    },
+    {
+      "key": "TREG_GITHUB_CLIENT_ID",
+      "description": "GitHub OAuth App Client ID for sign-in. Create at github.com/settings/developers → New OAuth App. Callback URL: <your deployment URL>/auth/github/callback.",
+      "label": "GitHub OAuth Client ID (recommended login)",
+      "type": "string",
+      "advanced": false,
+      "helpText": "Strongly recommended — gives every visitor a real identity on the registry without you needing to configure a mail provider. Requires a GitHub OAuth App whose callback is set to https://<deployment>/auth/github/callback."
+    },
+    {
+      "key": "TREG_GITHUB_CLIENT_SECRET",
+      "description": "Secret for the GitHub OAuth app above.",
+      "label": "GitHub OAuth Client Secret",
+      "type": "secret",
+      "advanced": false,
+      "helpText": "Leave blank if you are not using GitHub login. At least one identity provider (GitHub / Google / Resend email) is required for the first account."
+    },
+    {
+      "key": "TREG_RESEND_API_KEY",
+      "description": "Resend API key for email OTP sign-in + team invites. Requires a Resend-verified sending domain (treg requires a real from-domain for SPF/DKIM).",
+      "label": "Resend API key (optional — email login)",
+      "type": "secret",
+      "advanced": true,
+      "helpText": "Only needed if you want users to log in by email OTP instead of (or in addition to) GitHub/Google. The sending domain must be verified in Resend for SPF/DKIM to pass."
+    },
+    {
+      "key": "TREG_EMAIL_FROM",
+      "description": "From header for transactional email. Defaults to tools-registry <no-reply@treg.to> — change to your verified domain.",
+      "label": "Email From header",
+      "type": "string",
+      "advanced": true,
+      "helpText": "Example: tools-registry <no-reply@your-domain.com>"
+    }
+  ]
+}
