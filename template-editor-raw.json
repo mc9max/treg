@@ -1,41 +1,22 @@
 {
-  "variables": [
-    {
-      "key": "TREG_PUBLIC_URL",
-      "description": "Public base URL users reach. Railway injects the deployment's domain.",
-      "label": "Public URL",
-      "value": "",
-      "advanced": false
-    },
-    {
-      "key": "TREG_GITHUB_CLIENT_ID",
-      "description": "OAuth App Client ID for GitHub sign-in (recommended).",
-      "label": "GitHub OAuth Client ID",
-      "value": "",
-      "advanced": false
-    },
-    {
-      "key": "TREG_GITHUB_CLIENT_SECRET",
-      "description": "OAuth App Secret for GitHub sign-in.",
-      "label": "GitHub OAuth Client Secret",
-      "value": "",
-      "type": "secret",
-      "advanced": false
-    },
-    {
-      "key": "TREG_RESEND_API_KEY",
-      "description": "Resend API key (optional, for email OTP login).",
-      "label": "Resend API key",
-      "value": "",
-      "type": "secret",
-      "advanced": true
-    },
-    {
-      "key": "TREG_EMAIL_FROM",
-      "description": "Email From header (defaults to tools-registry <no-reply@treg.to>).",
-      "label": "Email From",
-      "value": "",
-      "advanced": true
-    }
-  ]
+  "TREG_PUBLIC_URL": {
+    "value": "",
+    "description": "Public URL this instance is reachable at (e.g. https://treg-abc123.up.railway.app). MUST be set to the Railway deployment domain before first login — it anchors the GitHub OAuth callback. Leave blank during deploy; update it after the first deploy once you know the domain, then redeploy."
+  },
+  "TREG_GITHUB_CLIENT_ID": {
+    "value": "",
+    "description": "GitHub OAuth App Client ID (recommended login door). Create at github.com/settings/developers. The callback URL to register is: https://YOUR-DEPLOYMENT-DOMAIN/auth/github/callback"
+  },
+  "TREG_GITHUB_CLIENT_SECRET": {
+    "value": "",
+    "description": "GitHub OAuth App Client Secret (pair with TREG_GITHUB_CLIENT_ID). Required for the GitHub login door to work. At least one identity provider must be configured before first sign-in."
+  },
+  "TREG_RESEND_API_KEY": {
+    "value": "",
+    "description": "Optional — Resend API key for email OTP login. Requires a Resend-verified sending domain (SPF/DKIM)."
+  },
+  "TREG_EMAIL_FROM": {
+    "value": "",
+    "description": "Optional — From header for transactional email (e.g. treg <no-reply@your-domain.com>). Defaults to tools-registry <no-reply@treg.to> if left blank."
+  }
 }
