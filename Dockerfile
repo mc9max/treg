@@ -167,7 +167,6 @@ USER treg
 COPY --chown=treg:treg entrypoint.sh /entrypoint.sh
 RUN chmod 755 /entrypoint.sh
 
-VOLUME ["/app/data"]
 EXPOSE 18790
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=90s --retries=4 \
