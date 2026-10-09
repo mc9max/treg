@@ -1,7 +1,7 @@
 {
   "TREG_PUBLIC_URL": {
-    "value": "",
-    "description": "Public URL this instance is reachable at (e.g. https://treg-abc123.up.railway.app). MUST be set to the Railway deployment domain before first login — it anchors the GitHub OAuth callback. Leave blank during deploy; update it after the first deploy once you know the domain, then redeploy."
+    "value": "https://${{RAILWAY_PUBLIC_DOMAIN}}",
+    "description": "Public URL this instance is reachable at. Auto-filled from the deployment's Railway domain (https://YOUR-DEPLOYMENT-DOMAIN) and used to build the GitHub OAuth callback — leave it as-is unless you put a custom domain / CNAME in front, in which case set it to that domain."
   },
   "TREG_GITHUB_CLIENT_ID": {
     "value": "",
