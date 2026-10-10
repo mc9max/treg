@@ -1,6 +1,6 @@
 # Deploy and Host treg on Railway
 
-[![Deploy to Railway](https://railway.app/button.svg)](https://railway.com/deploy/treg)
+[![Deploy to Railway](https://railway.app/button.svg)](https://railway.com/deploy/treg-1)
 
 OpenRouter for agent tools — one base URL and one token to reach a catalog
 of thousands of priced API endpoints (SEO, social, enrichment, ads, scraping,
@@ -46,7 +46,7 @@ default for a fresh deploy), and the public domain routes to that port.
 
 - An agent stack (your LLM provider + agent framework) that needs real-world
   actions — backlinks, social posts, company records, ad data, images,
-  video — behind one `Authorization: Bearer <treg token>` header.
+  video — behind one `Authorization: Bearer YOUR-TREG-TOKEN` header.
 - A shared team dashboard to grant each teammate their own treg token, their
   own balance / own keys, and their own set of visible tools.
 - A self-hosted "tools-as-HTTP" gateway in front of any LLM, so the LLM
