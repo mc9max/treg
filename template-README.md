@@ -80,13 +80,16 @@ still succeeds):
   phoning treg.to from the agent-side; leave unset only if you want the
   hosted catalog kept in sync upstream.
 
-GitHub OAuth is the only identity door configured in this template's form
-(`TREG_GITHUB_CLIENT_ID` + `TREG_GITHUB_CLIENT_SECRET`); Google OAuth is
-available in the codebase but is not exposed as a form variable here, and
-self-hosted SMTP is likewise available in code but not surfaced as form
-variables. If you want either, extend `template-vars.json` with the
-`TREG_GOOGLE_*` / `TREG_SMTP_*` keys and re-publish — the image already
-supports them.
+GitHub OAuth is the recommended identity door
+(`TREG_GITHUB_CLIENT_ID` + `TREG_GITHUB_CLIENT_SECRET`); the Google OAuth
+door (`TREG_GOOGLE_CLIENT_ID` + `TREG_GOOGLE_CLIENT_SECRET`) and the email
+OTP door (Resend) are also available as form variables. **At least one
+identity door must be configured before first sign-in** — a fresh instance
+with every door blank will return 503/`not configured` on GitHub/Google and
+will accept email codes but deliver nothing without a mail sender. Until you
+have one, the credential-free escape hatch is `TREG_FIXED_LOGIN_CODES`:
+choose a code, store its SHA-256 hex as `email=YOUR-SHA256-HEX` (a 64-char
+hex string), then sign in by typing that code: no mail server, no OAuth app.
 
 ## Notes
 
