@@ -58,14 +58,6 @@
       "type": "string",
       "advanced": true,
       "helpText": "Format: display-name <user@your-domain.com>"
-    },
-    {
-      "key": "TREG_FIXED_LOGIN_CODES",
-      "description": "Credential-free first login (no mail, no OAuth app): email=<64-hex sha256 of a code you chose>. For that email, the email-code door sends nothing and accepts only that code. Add your own before you need it — it's your escape hatch when no identity door works yet.",
-      "label": "Fixed login code (credential-free first login)",
-      "type": "string",
-      "advanced": true,
-      "helpText": "Shape: email=hex, comma-separated for several. Value is the SHA-256 of the code (not the code). Lets one designated address sign in by typing the code, with no email or OAuth provider configured."
     }
   ]
 }

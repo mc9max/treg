@@ -26,9 +26,5 @@
   "TREG_EMAIL_FROM": {
     "value": "",
     "description": "Optional — From header for transactional email. Default: tools-registry <no-reply@treg.to>; set to your Resend-verified domain if you enable the email door."
-  },
-  "TREG_FIXED_LOGIN_CODES": {
-    "value": "",
-    "description": "Optional — credential-free first login for one designated email. Format: email=hex (hex is the SHA-256 of a code you chose; comma-separate several). For that email the email-code door sends nothing and accepts only that code. Your escape hatch if no provider is configured yet."
   }
 }

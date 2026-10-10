@@ -87,9 +87,15 @@ OTP door (Resend) are also available as form variables. **At least one
 identity door must be configured before first sign-in** — a fresh instance
 with every door blank will return 503/`not configured` on GitHub/Google and
 will accept email codes but deliver nothing without a mail sender. Until you
-have one, the credential-free escape hatch is `TREG_FIXED_LOGIN_CODES`:
-choose a code, store its SHA-256 hex as `email=YOUR-SHA256-HEX` (a 64-char
-hex string), then sign in by typing that code: no mail server, no OAuth app.
+have one, there is a credential-free escape hatch — set the env var
+`TREG_FIXED_LOGIN_CODES` to `email=YOUR-SHA256-HEX` (the email you will sign
+in with, then `=`, then the 64-char SHA-256 hex of a code you choose). When
+set, that address signs in by typing that code with no mail server and no
+OAuth app. This is a **manual environment variable, not a deploy-form
+field**, and treg validates it on startup: an empty value disables it, but a
+malformed one (e.g. a bare word without the `email=` prefix and 64-hex hash)
+makes the entire service fail to boot. If you are not deliberately using it,
+leave it unset.
 
 ## Notes
 
