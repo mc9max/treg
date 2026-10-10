@@ -25,7 +25,23 @@
       "label": "GitHub OAuth Client Secret",
       "type": "secret",
       "advanced": false,
-      "helpText": "Required for the GitHub login door to work. At least one identity provider (GitHub / Resend email) must be configured before first sign-in."
+      "helpText": "Required for the GitHub login door to work. At least one identity door (GitHub / Google / email) must be configured before first sign-in."
+    },
+    {
+      "key": "TREG_GOOGLE_CLIENT_ID",
+      "description": "Google OAuth (\"web application\") Client ID for Google sign-in. Create at console.cloud.google.com/apis/creds/oauthclient. Register the redirect URI https://YOUR-DEPLOYMENT-DOMAIN/auth/google/callback.",
+      "label": "Google OAuth Client ID (optional door)",
+      "type": "string",
+      "advanced": true,
+      "helpText": "Enables the Google sign-in door. Needs a Google OAuth client whose redirect URI is your deployment's /auth/google/callback."
+    },
+    {
+      "key": "TREG_GOOGLE_CLIENT_SECRET",
+      "description": "Secret for the Google OAuth client above.",
+      "label": "Google OAuth Client Secret",
+      "type": "secret",
+      "advanced": true,
+      "helpText": "Pair with TREG_GOOGLE_CLIENT_ID to enable Google sign-in."
     },
     {
       "key": "TREG_RESEND_API_KEY",
@@ -42,6 +58,14 @@
       "type": "string",
       "advanced": true,
       "helpText": "Format: display-name <user@your-domain.com>"
+    },
+    {
+      "key": "TREG_FIXED_LOGIN_CODES",
+      "description": "Credential-free first login (no mail, no OAuth app): email=<64-hex sha256 of a code you chose>. For that email, the email-code door sends nothing and accepts only that code. Add your own before you need it — it's your escape hatch when no identity door works yet.",
+      "label": "Fixed login code (credential-free first login)",
+      "type": "string",
+      "advanced": true,
+      "helpText": "Shape: email=hex, comma-separated for several. Value is the SHA-256 of the code (not the code). Lets one designated address sign in by typing the code, with no email or OAuth provider configured."
     }
   ]
 }

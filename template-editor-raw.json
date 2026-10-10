@@ -9,7 +9,15 @@
   },
   "TREG_GITHUB_CLIENT_SECRET": {
     "value": "",
-    "description": "GitHub OAuth App Client Secret (pair with TREG_GITHUB_CLIENT_ID). Required for the GitHub login door to work. At least one identity provider must be configured before first sign-in."
+    "description": "Secret for the GitHub OAuth app above. Required for the GitHub login door."
+  },
+  "TREG_GOOGLE_CLIENT_ID": {
+    "value": "",
+    "description": "Google OAuth (web application) Client ID for Google sign-in. Register redirect URI https://YOUR-DEPLOYMENT-DOMAIN/auth/google/callback"
+  },
+  "TREG_GOOGLE_CLIENT_SECRET": {
+    "value": "",
+    "description": "Secret for the Google OAuth client above (pair with TREG_GOOGLE_CLIENT_ID)"
   },
   "TREG_RESEND_API_KEY": {
     "value": "",
@@ -17,6 +25,10 @@
   },
   "TREG_EMAIL_FROM": {
     "value": "",
-    "description": "Optional — From header for transactional email (e.g. treg <no-reply@your-domain.com>). Defaults to tools-registry <no-reply@treg.to> if left blank."
+    "description": "Optional — From header for transactional email. Default: tools-registry <no-reply@treg.to>; set to your Resend-verified domain if you enable the email door."
+  },
+  "TREG_FIXED_LOGIN_CODES": {
+    "value": "",
+    "description": "Optional — credential-free first login for one designated email. Format: email=hex (hex is the SHA-256 of a code you chose; comma-separate several). For that email the email-code door sends nothing and accepts only that code. Your escape hatch if no provider is configured yet."
   }
 }
