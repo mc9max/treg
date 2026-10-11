@@ -1,6 +1,6 @@
 # Deploy and Host treg on Railway
 
-[![Deploy to Railway](https://railway.app/button.svg)](https://railway.com/deploy/treg-1)
+[![Deploy to Railway](https://railway.app/button.svg)](https://railway.com/deploy/treg)
 
 OpenRouter for agent tools — one base URL and one token to reach a catalog
 of thousands of priced API endpoints (SEO, social, enrichment, ads, scraping,
@@ -46,7 +46,7 @@ default for a fresh deploy), and the public domain routes to that port.
 
 - An agent stack (your LLM provider + agent framework) that needs real-world
   actions — backlinks, social posts, company records, ad data, images,
-  video — behind one `Authorization: Bearer YOUR-TREG-TOKEN` header.
+  video — behind one `Authorization: Bearer YOUR-TOKEN` header.
 - A shared team dashboard to grant each teammate their own treg token, their
   own balance / own keys, and their own set of visible tools.
 - A self-hosted "tools-as-HTTP" gateway in front of any LLM, so the LLM
@@ -96,6 +96,14 @@ field**, and treg validates it on startup: an empty value disables it, but a
 malformed one (e.g. a bare word without the `email=` prefix and 64-hex hash)
 makes the entire service fail to boot. If you are not deliberately using it,
 leave it unset.
+
+To use the escape hatch on a live deployment: pick the sign-in email and a
+short code, hash the code (`printf %s YOUR-CODE | sha256sum`), add a **New Raw
+Variable** `TREG_FIXED_LOGIN_CODES` with value `YOUR-EMAIL=YOUR-64-CHAR-HASH`
+on the treg service, redeploy, then open the login page and use its email
+door with that email + code. Sign-in sessions survive redeploys — the Fernet
+session key and the database live on the `treg-data` volume, so a restart
+never logs you out.
 
 ## Notes
 
