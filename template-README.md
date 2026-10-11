@@ -1,6 +1,6 @@
 # Deploy and Host treg on Railway
 
-[![Deploy to Railway](https://railway.app/button.svg)](https://railway.com/deploy/treg)
+[![Deploy to Railway](https://railway.app/button.svg)](https://railway.com/deploy/treg-1)
 
 OpenRouter for agent tools — one base URL and one token to reach a catalog
 of thousands of priced API endpoints (SEO, social, enrichment, ads, scraping,
