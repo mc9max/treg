@@ -1,5 +1,6 @@
 #!/usr/bin/env sh
-# treg entrypoint — runs as the `treg` user (uid 10001), PID 1.
+# treg entrypoint — runs as root (PID 1). Railway mounts volumes
+# root-owned, so a non-root user cannot write /app/data; root can.
 #
 # Order:
 #   1. Ensure /app/data is writable and create the treg key file on first boot.

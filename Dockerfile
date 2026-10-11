@@ -105,8 +105,13 @@ RUN set -eux; \
     uvx --version 2>/dev/null || true; \
     apt-get clean; rm -rf /var/lib/apt/lists/*
 
-# named user (uid 10001) that owns /app — the volume's files stay consistent
-# across redeploys (avoids a stray root-owned file blocking the treg run)
+# named user (uid 10001) that still owns /app — file ownership stays
+# consistent across redeploys (avoids a stray root-owned file confusing
+# tooling). The RUNTIME USER is root, though: Railway mounts volumes
+# root-owned, and a non-root container cannot write into one (the
+# 2026-10-10 authoring deploy crashed at entrypoint.sh:25 with
+# `cannot create /app/data/treg-key: Permission denied` for exactly
+# this reason). Same call as allure-server/rackpad: run as root.
 RUN useradd --system --uid 10001 --home-dir /app treg
 WORKDIR /app
 
@@ -156,14 +161,15 @@ RUN test -f src/treg/web/landing.html \
  && ls src/treg/web/vendor/vue-*.global.prod.js >/dev/null
 
 # -- 2d: prepare the data volume dir + entrypoint.
-#       Create /app/data AS ROOT — the /app tree was just COPY'd and
-#       therefore root-owned; the treg user can't mkdir into a root-owned
-#       755 dir.  Own the whole /app as treg (single-user app container;
-#       secrets live under /app/data + /app/.venv) so runtime writes work
-#       without setuid tricks.
+#       /app/data must exist in the image (fresh installs without a
+#       volume write here) and stays treg-owned for consistent tooling,
+#       BUT the runtime USER is root: Railway bind-mounts volumes
+#       root-owned (uid 0), which shadows this chown — a non-root
+#       process then cannot create even its key file inside the mount.
+#       Root writes both the bind-mounted volume and this in-image dir.
 RUN mkdir -p /app/data && chmod 750 /app/data \
  && chown -R treg:treg /app
-USER treg
+USER root
 COPY --chown=treg:treg entrypoint.sh /entrypoint.sh
 RUN chmod 755 /entrypoint.sh
 
